@@ -1,0 +1,122 @@
+[
+    {
+        "id":  1,
+        "lr_path":  "lr/0001_artwork_26_like.png",
+        "pref_generated_path":  "preferred/0001_artwork_26_like.png",
+        "prompt":  "An eighteenth-century decorative landscape panel with a river, rocks, castle ruins, a distant windmill and a muted green mountain, simplified painterly forms"
+    },
+    {
+        "id":  2,
+        "lr_path":  "lr/0002_artwork_26_like.png",
+        "pref_generated_path":  "preferred/0002_artwork_26_like.png",
+        "prompt":  "An eighteenth-century decorative landscape panel with a river, rocks, castle ruins, a distant windmill and a muted green mountain, simplified painterly forms"
+    },
+    {
+        "id":  3,
+        "lr_path":  "lr/0003_artwork_27_like.png",
+        "pref_generated_path":  "preferred/0003_artwork_27_like.png",
+        "prompt":  "An eighteenth-century decorative painted bouquet of flowers with butterflies, simplified forms, visible brushstrokes and ample background"
+    },
+    {
+        "id":  4,
+        "lr_path":  "lr/0004_artwork_27_like.png",
+        "pref_generated_path":  "preferred/0004_artwork_27_like.png",
+        "prompt":  "An eighteenth-century decorative painted bouquet of flowers with butterflies, simplified forms, visible brushstrokes and ample background"
+    },
+    {
+        "id":  5,
+        "lr_path":  "lr/0005_artwork_35_like.png",
+        "pref_generated_path":  "preferred/0005_artwork_35_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background"
+    },
+    {
+        "id":  6,
+        "lr_path":  "lr/0006_artwork_35_like.png",
+        "pref_generated_path":  "preferred/0006_artwork_35_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background"
+    },
+    {
+        "id":  7,
+        "lr_path":  "lr/0007_artwork_35_like.png",
+        "pref_generated_path":  "preferred/0007_artwork_35_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background"
+    },
+    {
+        "id":  8,
+        "lr_path":  "lr/0008_artwork_36_like.png",
+        "pref_generated_path":  "preferred/0008_artwork_36_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with a deer, spotted hunting dogs, a tree canopy and sky, simplified painterly forms"
+    },
+    {
+        "id":  9,
+        "lr_path":  "lr/0009_artwork_52_like.png",
+        "pref_generated_path":  "preferred/0009_artwork_52_like.png",
+        "prompt":  "An eighteenth-century decorative pastoral landscape with cattle, a shepherd, trees and a ruined stone tower, simplified forms and broad painterly brushstrokes"
+    },
+    {
+        "id":  10,
+        "lr_path":  "lr/0010_artwork_53_like.png",
+        "pref_generated_path":  "preferred/0010_artwork_53_like.png",
+        "prompt":  "An eighteenth-century decorative landscape with a waterfall, trees, a small distant house and a classical pavilion, warm yellow tones and layered scenery"
+    },
+    {
+        "id":  11,
+        "lr_path":  "lr/0011_artwork_33_like.png",
+        "pref_generated_path":  "preferred/0011_artwork_33_like.png",
+        "prompt":  "An eighteenth-century decorative painted panel of a young woman holding a pitcher, flat stylized forms, terracotta tones and broad brushstrokes"
+    },
+    {
+        "id":  12,
+        "lr_path":  "lr/0012_artwork_35_like.png",
+        "pref_generated_path":  "preferred/0012_artwork_35_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background"
+    },
+    {
+        "id":  13,
+        "lr_path":  "lr/0013_artwork_35_like.png",
+        "pref_generated_path":  "preferred/0013_artwork_35_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background"
+    },
+    {
+        "id":  14,
+        "lr_path":  "lr/0014_artwork_36_like.png",
+        "pref_generated_path":  "preferred/0014_artwork_36_like.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with a deer, spotted hunting dogs, a tree canopy and sky, simplified painterly forms"
+    },
+    {
+        "id":  15,
+        "lr_path":  "lr/0015_artwork_53_like.png",
+        "pref_generated_path":  "preferred/0015_artwork_53_like.png",
+        "prompt":  "An eighteenth-century decorative landscape with a waterfall, trees, a small distant house and a classical pavilion, warm yellow tones and layered scenery"
+    },
+    {
+        "id":  16,
+        "lr_path":  "lr/0016_artwork_53_like.png",
+        "pref_generated_path":  "preferred/0016_artwork_53_like.png",
+        "prompt":  "An eighteenth-century decorative landscape with a waterfall, trees, a small distant house and a classical pavilion, warm yellow tones and layered scenery"
+    },
+    {
+        "id":  17,
+        "lr_path":  "lr/0017_artwork_26_expert_accepted.png",
+        "pref_generated_path":  "preferred/0017_artwork_26_expert_accepted.png",
+        "prompt":  "An eighteenth-century decorative landscape panel with a river, rocks, castle ruins, a distant windmill and a muted green mountain, simplified painterly forms"
+    },
+    {
+        "id":  18,
+        "lr_path":  "lr/0018_artwork_35_expert_accepted.png",
+        "pref_generated_path":  "preferred/0018_artwork_35_expert_accepted.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background"
+    },
+    {
+        "id":  19,
+        "lr_path":  "lr/0019_artwork_36_expert_accepted.png",
+        "pref_generated_path":  "preferred/0019_artwork_36_expert_accepted.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with a deer, spotted hunting dogs, a tree canopy and sky, simplified painterly forms"
+    },
+    {
+        "id":  20,
+        "lr_path":  "lr/0020_artwork_44_expert_accepted.png",
+        "pref_generated_path":  "preferred/0020_artwork_44_expert_accepted.png",
+        "prompt":  "An eighteenth-century decorative painted panel of a bullfinch perched on a branch beside a rose, simplified forms and visible brushstrokes"
+    }
+]
