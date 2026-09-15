@@ -1,0 +1,126 @@
+[
+    {
+        "id":  1,
+        "hr_path":  "upscaling_dataset/HR/image_0001.png",
+        "prompt": "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background."
+        
+    },
+    {
+        "id":  2,
+        "hr_path":  "upscaling_dataset/HR/image_0002.png",
+        "prompt": "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background."
+    
+    },
+    {
+        "id":  3,
+        "hr_path":  "upscaling_dataset/HR/image_0003.png",
+        "prompt":  "An eighteenth-century decorative hunting scene with two deer and running dogs, simplified painterly forms, broad brushstrokes and ample background."
+    
+    },
+    {
+        "id":  4,
+        "hr_path":  "upscaling_dataset/HR/image_0004.png",
+        "prompt": "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background."
+    
+    },
+    {
+        "id":  5,
+        "hr_path":  "upscaling_dataset/HR/image_0005.png",
+        "prompt": "An eighteenth-century decorative painted panel of a young woman holding a pitcher, flat stylized forms, terracotta tones and broad brushstrokes."
+    
+    },
+    {
+        "id":  6,
+        "hr_path":  "upscaling_dataset/HR/image_0006.png",
+        "prompt": "An eighteenth-century decorative hunting scene with boar and running dogs, simplified painterly forms, broad brushstrokes and ample background."
+    
+    },
+    {
+        "id":  7,
+        "hr_path":  "upscaling_dataset/HR/image_0007.png",
+        "prompt": "An eighteenth-century decorative hunting scene with deer and running dogs, simplified painterly forms, broad brushstrokes and ample background."
+    
+    },
+    {
+        "id":  8,
+        "hr_path":  "upscaling_dataset/HR/image_0008.png",
+        "prompt": "A seventeenth-century oil painting with heavy, voluminous cumulus clouds, lush oak and deciduous trees with textured, dark green and golden-brown foliage and tiny figures — including a woman and a child walking along the path near the center."
+    
+    },
+    {
+        "id":  9,
+        "hr_path":  "upscaling_dataset/HR/image_0009.png",
+        "prompt": "A seventeenth-century oil painting depicts a dynamic, classic hunting scene framed by a dense, overarching forest. The center of the action features two hunters on horseback giving chase.  In front of them, a pack of swift hunting hounds is pursuing two deer that are fleeing toward the left side of the canvas."
+    
+    },
+    {
+        "id":  10,
+        "hr_path":  "upscaling_dataset/HR/image_0010.png",
+        "prompt": "A seventeenth-century oil painting with brick ruins of a castle, dense, mature trees with expressive, sprawling branches and a calm pond that reflects the moody sky."
+    
+    },
+    {
+        "id":  11,
+        "hr_path":  "upscaling_dataset/HR/image_0011.png",
+        "prompt": "An eighteenth-century oil painting with dense trees, large, craggy mountains, a small group of peasants rest on rocks under the shadow of a large, rugged cliffside tree and a calm body of water that stretches across the center, reflecting the soft ambient light."
+    
+    },
+    {
+        "id":  12,
+        "hr_path":  "upscaling_dataset/HR/image_0012.png",
+        "prompt": "A seventeenth-century oil painting with a small cluster of livestock resting on a grassy patch of ground. On the left stands a prominent white goat with large brown patches and long, curved horns. In the center, two thick-fleece, fluffy white sheep are lying close together on the grass. Peeking out from behind them on the right is the dark head and horns of a black goat."
+    
+    },
+    {
+        "id":  13,
+        "hr_path":  "upscaling_dataset/HR/image_0013.png",
+        "prompt": "A eighteenth-century oil painting with a pastoral, bucolic scene combining natural elements with classical architectural ruins."
+    
+    },
+    {
+        "id":  14,
+        "hr_path":  "upscaling_dataset/HR/image_0014.png",
+        "prompt": "An eighteenth-century pastoral landscape with a group of villagers, a small herd of cattle and small, rustic Italian village or cluster of stone buildings nestled among distinct Mediterranean pine trees."
+    
+    },
+    {
+        "id":  15,
+        "hr_path":  "upscaling_dataset/HR/image_0015.png",
+        "prompt": "An eighteenth-century oil painting with a picturesque, idealized rustic setting filled with everyday pastoral activities. The central focus of the left side is a rustic, thatched-roof cottage with a chimney emitting a thin plume of dark smoke. Several figures are scattered throughout the foreground engaged in daily tasks."
+    
+    },
+    {
+        "id":  16,
+        "hr_path":  "upscaling_dataset/HR/image_0016.png",
+        "prompt": "An eighteenth-century decorative landscape panel with a river, rocks, castle ruins, a distant windmill and a muted green mountain, simplified painterly forms."
+    
+    },
+    {
+        "id":  17,
+        "hr_path":  "upscaling_dataset/HR/image_0017.png",
+        "prompt":  "An eighteenth-century decorative painted panel of a painted floral bouquet centered against a solid, dark navy blue background."
+    },
+    {
+        "id":  18,
+        "hr_path":  "upscaling_dataset/HR/image_0018.png",
+        "prompt":  "An eighteenth-century decorative painted panel of a sparrow perched on a branch beside a rose, simplified forms and visible brushstrokes"
+    },
+    {
+        "id":  19,
+        "hr_path":  "upscaling_dataset/HR/image_0019.png",
+        "prompt": "An eighteenth-century classical landscape oil painting presented within a circular composition with a calm, wide river, fisherman, tower and soft, hazy blue mountains."
+    
+    },
+    {
+        "id":  20,
+        "hr_path":  "upscaling_dataset/HR/image_0020.png",
+        "prompt": "An eighteenth-century decorative landscape panel with a river, rocks, castle ruins, a distant windmill and a muted green mountain, simplified painterly forms."
+    
+    },
+    {
+        "id":  21,
+        "hr_path":  "upscaling_dataset/HR/image_0021.png",
+        "prompt": "An eighteenth-century decorative landscape with a waterfall, trees, a small distant house and a classical pavilion, warm yellow tones and layered scenery."
+    
+    }
+]
