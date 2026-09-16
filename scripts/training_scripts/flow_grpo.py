@@ -9,10 +9,10 @@ The training path implemented here is:
                   -> group-relative advantages
                   -> clipped GRPO update of LoRA weights
 
-The input manifest is the ``manifest.json`` written by ``baseline_results.py``.
+The input may be a paired manifest or the bundled HR degradation manifest.
 
 Example:
-    python scripts/training_scripts/flow_grpo.py --manifest p_ref_dataset/manifest.json
+    python scripts/training_scripts/flow_grpo.py
 
 Required packages:
     pip install torch torchvision diffusers transformers accelerate peft safetensors opencv-python numpy
@@ -21,6 +21,7 @@ Required packages:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import random
@@ -51,7 +52,8 @@ from metrics_checker import ArtQualityEvaluator
 @dataclass
 class FlowGRPOConfig:
     model_id: str = "stabilityai/stable-diffusion-x4-upscaler"
-    manifest: str = "p_ref_dataset/manifest.json"
+    manifest: str = "flow_grpo_dataset/upscaling_dataset/manifest.json"
+    lr_pipeline: str | None = None
     output_dir: str = "flow_grpo_output"
     resolution: int = 120
     group_size: int = 4
@@ -111,8 +113,100 @@ def _resolve_manifest_path(value: str, manifest_path: Path) -> Path:
     return candidates[0].resolve()
 
 
-def load_baseline_manifest(path: str, max_samples: int | None) -> list[ManifestRecord]:
-    """Read the exact record format produced by BaselineReferenceLogger."""
+def _find_by_stem(directory: Path, filename: str) -> Path:
+    """Resolve a dataset file even when a manifest contains the wrong suffix."""
+
+    requested = directory / filename
+    if requested.is_file():
+        return requested.resolve()
+
+    matches = [
+        candidate
+        for candidate in directory.glob(f"{Path(filename).stem}.*")
+        if candidate.is_file()
+    ]
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"Could not uniquely resolve {filename!r} in {directory}; "
+            f"found {len(matches)} matches."
+        )
+    return matches[0].resolve()
+
+
+def _load_degraded_dataset_manifest(
+    raw_records: list[dict[str, Any]],
+    manifest_path: Path,
+    lr_pipeline: str | None,
+) -> list[ManifestRecord]:
+    """Expand the HR manifest plus metadata.csv into trainable LR/HR pairs."""
+
+    metadata_path = manifest_path.parent / "metadata.csv"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(
+            f"The HR-only manifest requires degradation metadata: {metadata_path}"
+        )
+
+    with metadata_path.open("r", encoding="utf-8-sig", newline="") as file:
+        metadata_rows = list(csv.DictReader(file))
+
+    available_pipelines = sorted({row["pipeline"] for row in metadata_rows})
+    if lr_pipeline and lr_pipeline not in available_pipelines:
+        raise ValueError(
+            f"Unknown LR pipeline {lr_pipeline!r}; choose one of "
+            f"{available_pipelines}."
+        )
+
+    rows_by_stem: dict[str, list[dict[str, str]]] = {}
+    for row in metadata_rows:
+        if lr_pipeline and row["pipeline"] != lr_pipeline:
+            continue
+        rows_by_stem.setdefault(Path(row["filename"]).stem, []).append(row)
+
+    records: list[ManifestRecord] = []
+    for raw in raw_records:
+        if "hr_path" not in raw or "prompt" not in raw:
+            raise ValueError(
+                "Each HR manifest record must contain 'hr_path' and 'prompt'."
+            )
+
+        requested_reference = Path(str(raw["hr_path"]))
+        reference_directory = manifest_path.parent / requested_reference.parent
+        if not reference_directory.is_dir():
+            # The fetched manifest prefixes paths with "upscaling_dataset/"
+            # even though it already lives inside that directory.
+            reference_directory = (
+                manifest_path.parent / requested_reference.parent.name
+            )
+        reference_path = _find_by_stem(
+            reference_directory, requested_reference.name
+        )
+        rows = rows_by_stem.get(requested_reference.stem, [])
+        if not rows:
+            raise ValueError(
+                f"No LR degradation records found for "
+                f"{requested_reference.name!r}."
+            )
+
+        for row in rows:
+            lr_path = _find_by_stem(
+                manifest_path.parent / row["pipeline"], row["filename"]
+            )
+            records.append(
+                ManifestRecord(
+                    lr_path=lr_path,
+                    prompt=str(raw["prompt"]),
+                    reference_path=reference_path,
+                )
+            )
+    return records
+
+
+def load_baseline_manifest(
+    path: str,
+    max_samples: int | None,
+    lr_pipeline: str | None = None,
+) -> list[ManifestRecord]:
+    """Read a paired manifest or expand the repository's HR degradation dataset."""
 
     manifest_path = Path(path).expanduser().resolve()
     if not manifest_path.exists():
@@ -124,22 +218,33 @@ def load_baseline_manifest(path: str, max_samples: int | None) -> list[ManifestR
     with manifest_path.open("r", encoding="utf-8") as file:
         raw_records: list[dict[str, Any]] = json.load(file)
 
-    records: list[ManifestRecord] = []
-    for raw in raw_records[:max_samples]:
-        if "lr_path" not in raw or "prompt" not in raw:
-            raise ValueError("Each manifest record must contain 'lr_path' and 'prompt'.")
-        reference_value = raw.get("pref_generated_path")
-        records.append(
-            ManifestRecord(
-                lr_path=_resolve_manifest_path(raw["lr_path"], manifest_path),
-                prompt=str(raw["prompt"]),
-                reference_path=(
-                    _resolve_manifest_path(reference_value, manifest_path)
-                    if reference_value
-                    else None
-                ),
-            )
+    if raw_records and "hr_path" in raw_records[0]:
+        records = _load_degraded_dataset_manifest(
+            raw_records, manifest_path, lr_pipeline
         )
+    else:
+        records = []
+        for raw in raw_records:
+            if "lr_path" not in raw or "prompt" not in raw:
+                raise ValueError(
+                    "Each paired manifest record must contain "
+                    "'lr_path' and 'prompt'."
+                )
+            reference_value = raw.get("pref_generated_path")
+            records.append(
+                ManifestRecord(
+                    lr_path=_resolve_manifest_path(raw["lr_path"], manifest_path),
+                    prompt=str(raw["prompt"]),
+                    reference_path=(
+                        _resolve_manifest_path(reference_value, manifest_path)
+                        if reference_value
+                        else None
+                    ),
+                )
+            )
+
+    if max_samples is not None:
+        records = records[:max_samples]
 
     if not records:
         raise ValueError(f"The baseline manifest is empty: {manifest_path}")
@@ -222,7 +327,9 @@ class UpscalingReward:
         sharpness_penalties: list[float] = []
         saturation_penalties: list[float] = []
 
-        for image, downscaled_image in zip(images, downscaled_images, strict=True):
+        # ``strict=`` was added to zip in Python 3.10. These tensors are built
+        # from the same batch, so their lengths are already guaranteed equal.
+        for image, downscaled_image in zip(images, downscaled_images):
             generated = self._to_uint8_rgb(image)
             generated_downscaled = self._to_uint8_rgb(downscaled_image)
             sharpness = self.metrics_evaluator.compute_edge_sharpness_penalty(generated)
@@ -435,15 +542,22 @@ class FlowGRPOTrainer:
         previous_timestep: int,
         sample: Tensor,
     ) -> tuple[Tensor, Tensor]:
+        # Scheduler coefficients become numerically unstable in fp16 near the
+        # final denoising timestep (alpha is close to 1 and beta is close to
+        # zero). Keep the inexpensive DDIM scalar/tensor arithmetic in fp32;
+        # gradients still flow back through the cast to the fp16 UNet output.
+        output_dtype = sample.dtype
+        sample = sample.float()
+        model_output = model_output.float()
         alphas = self.scheduler.alphas_cumprod
-        alpha_t = alphas[timestep].to(device=sample.device, dtype=sample.dtype)
+        alpha_t = alphas[timestep].to(device=sample.device, dtype=torch.float32)
         if previous_timestep >= 0:
             alpha_previous = alphas[previous_timestep].to(
-                device=sample.device, dtype=sample.dtype
+                device=sample.device, dtype=torch.float32
             )
         else:
             alpha_previous = self.scheduler.final_alpha_cumprod.to(
-                device=sample.device, dtype=sample.dtype
+                device=sample.device, dtype=torch.float32
             )
 
         beta_t = 1 - alpha_t
@@ -472,7 +586,7 @@ class FlowGRPOTrainer:
         standard_deviation = self.config.eta * variance.sqrt()
         direction_scale = (1 - alpha_previous - standard_deviation.square()).clamp_min(0).sqrt()
         mean = alpha_previous.sqrt() * predicted_original + direction_scale * predicted_epsilon
-        return mean, standard_deviation
+        return mean.to(output_dtype), standard_deviation.to(output_dtype)
 
     @staticmethod
     def _transition_log_probability(value: Tensor, mean: Tensor, std: Tensor) -> Tensor:
@@ -523,9 +637,17 @@ class FlowGRPOTrainer:
                 class_labels,
                 prompt_embeddings,
             )
+            if not torch.isfinite(model_output).all():
+                raise FloatingPointError(
+                    f"UNet produced non-finite values at timestep {timestep}."
+                )
             mean, std = self._ddim_mean_and_std(
                 model_output, timestep, previous_timestep, latents
             )
+            if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+                raise FloatingPointError(
+                    f"DDIM transition produced non-finite values at timestep {timestep}."
+                )
 
             if float(std) > 0:
                 noise = torch.randn(
@@ -556,6 +678,8 @@ class FlowGRPOTrainer:
         decoded = self.pipe.vae.decode(
             latents / self.pipe.vae.config.scaling_factor, return_dict=False
         )[0]
+        if not torch.isfinite(decoded).all():
+            raise FloatingPointError("VAE decoder produced non-finite values.")
         if needs_upcasting:
             self.pipe.vae.to(dtype=self.weight_dtype)
         images = decoded.add(1).div(2).clamp(0, 1).float().cpu()
@@ -595,7 +719,6 @@ class FlowGRPOTrainer:
                 rollout.timesteps,
                 rollout.previous_timesteps,
                 rollout.old_log_probs,
-                strict=True,
             ):
                 state = state_cpu.to(self.device, dtype=self.weight_dtype)
                 next_state = next_state_cpu.to(self.device, dtype=self.weight_dtype)
@@ -722,7 +845,17 @@ class FlowGRPOTrainer:
 
 def parse_args() -> FlowGRPOConfig:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", default="p_ref_dataset/manifest.json")
+    parser.add_argument(
+        "--manifest",
+        default="flow_grpo_dataset/upscaling_dataset/manifest.json",
+    )
+    parser.add_argument(
+        "--lr-pipeline",
+        help=(
+            "For an HR-only manifest, train on one degradation pipeline "
+            "instead of all."
+        ),
+    )
     parser.add_argument("--output-dir", default="flow_grpo_output")
     parser.add_argument("--model-id", default="stabilityai/stable-diffusion-x4-upscaler")
     parser.add_argument("--epochs", type=int, default=1)
@@ -752,6 +885,7 @@ def parse_args() -> FlowGRPOConfig:
     return FlowGRPOConfig(
         model_id=args.model_id,
         manifest=args.manifest,
+        lr_pipeline=args.lr_pipeline,
         output_dir=args.output_dir,
         resolution=args.resolution,
         group_size=args.group_size,
@@ -781,7 +915,9 @@ def main() -> None:
     config = parse_args()
     torch.manual_seed(config.seed)
     random.seed(config.seed)
-    records = load_baseline_manifest(config.manifest, config.max_samples)
+    records = load_baseline_manifest(
+        config.manifest, config.max_samples, config.lr_pipeline
+    )
     trainer = FlowGRPOTrainer(config)
     trainer.train(records)
 
