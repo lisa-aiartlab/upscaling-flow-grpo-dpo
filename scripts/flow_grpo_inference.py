@@ -1,4 +1,4 @@
-"""Run Stable Diffusion x4 upscaling with a trained Flow-GRPO LoRA.
+"""Run FLUX.2 Klein 4B upscaling with a trained Flow-GRPO LoRA.
 
 Example:
     python scripts/flow_grpo_inference.py \
@@ -43,7 +43,17 @@ import torch
 from PIL import Image, ImageOps
 from peft import LoraConfig, set_peft_model_state_dict
 
-from diffusers import DDIMScheduler, StableDiffusionUpscalePipeline
+from diffusers import Flux2KleinPipeline
+
+
+FLUX2_KLEIN_LORA_TARGETS = [
+    "to_k",
+    "to_q",
+    "to_v",
+    "to_out.0",
+    "to_qkv_mlp_proj",
+    *[f"single_transformer_blocks.{index}.attn.to_out" for index in range(24)],
+]
 
 
 DEFAULT_CHECKPOINT = PROJECT_DIRECTORY / "flow_grpo_output" / "final" / "flow_grpo_lora.pt"
@@ -62,14 +72,14 @@ def load_checkpoint(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"LoRA checkpoint was not found: {path}")
 
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    required_keys = {"config", "unet_lora"}
+    required_keys = {"config", "transformer_lora"}
     missing_keys = required_keys.difference(checkpoint)
     if missing_keys:
         raise ValueError(
             f"Invalid Flow-GRPO checkpoint; missing keys: {sorted(missing_keys)}"
         )
 
-    state_dict = checkpoint["unet_lora"]
+    state_dict = checkpoint["transformer_lora"]
     non_finite = [
         name for name, value in state_dict.items() if not torch.isfinite(value).all()
     ]
@@ -95,15 +105,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", required=True, help="Input low-resolution image")
     parser.add_argument("--prompt", required=True, help="Description of the image")
-    parser.add_argument("--negative-prompt", help="Elements that should not appear")
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--model-id", help="Override model ID stored in the checkpoint")
     parser.add_argument("--resolution", type=int, help="LR side length; default from checkpoint")
-    parser.add_argument("--inference-steps", type=int, default=20)
+    parser.add_argument("--inference-steps", type=int)
     parser.add_argument("--guidance-scale", type=float, help="Default from checkpoint")
-    parser.add_argument("--noise-level", type=int, help="Default from checkpoint")
-    parser.add_argument("--eta", type=float, help="DDIM stochasticity; default from checkpoint")
     parser.add_argument("--lora-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--local-files-only", action="store_true")
@@ -124,48 +131,43 @@ def main() -> None:
     training_config = checkpoint["config"]
 
     model_id = args.model_id or training_config.get(
-        "model_id", "stabilityai/stable-diffusion-x4-upscaler"
+        "model_id", "black-forest-labs/FLUX.2-klein-4B"
     )
     resolution = args.resolution or int(training_config.get("resolution", 120))
     guidance_scale = (
         args.guidance_scale
         if args.guidance_scale is not None
-        else float(training_config.get("guidance_scale", 7.5))
+        else float(training_config.get("guidance_scale", 1.0))
     )
-    noise_level = (
-        args.noise_level
-        if args.noise_level is not None
-        else int(training_config.get("noise_level", 20))
-    )
-    eta = (
-        args.eta
-        if args.eta is not None
-        else float(training_config.get("eta", 1.0))
+    inference_steps = (
+        args.inference_steps
+        if args.inference_steps is not None
+        else int(training_config.get("inference_steps", 4))
     )
     lora_rank = int(training_config.get("lora_rank", 4))
+    precision = training_config.get("mixed_precision", "bf16")
+    weight_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
 
-    if resolution % 8:
-        raise ValueError("Resolution must be divisible by 8.")
+    if resolution % 4:
+        raise ValueError("Resolution must be divisible by 4.")
 
-    pipe = StableDiffusionUpscalePipeline.from_pretrained(
+    pipe = Flux2KleinPipeline.from_pretrained(
         model_id,
-        torch_dtype=torch.float16,
+        torch_dtype=weight_dtype,
         local_files_only=args.local_files_only,
     )
-    pipe.scheduler = DDIMScheduler.from_config(pipe.scheduler.config)
     pipe.vae.enable_slicing()
-    pipe.enable_attention_slicing()
 
     lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_rank,
         init_lora_weights="gaussian",
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        target_modules=FLUX2_KLEIN_LORA_TARGETS,
     )
-    pipe.unet.add_adapter(lora_config, adapter_name="default")
+    pipe.transformer.add_adapter(lora_config, adapter_name="default")
     incompatible = set_peft_model_state_dict(
-        pipe.unet,
-        checkpoint["unet_lora"],
+        pipe.transformer,
+        checkpoint["transformer_lora"],
         adapter_name="default",
     )
     if incompatible.unexpected_keys:
@@ -173,8 +175,8 @@ def main() -> None:
             "Unexpected keys while loading LoRA: "
             + ", ".join(incompatible.unexpected_keys[:5])
         )
-    pipe.unet.set_adapters("default", weights=args.lora_scale)
-    pipe.unet.eval()
+    pipe.transformer.set_adapters("default", weights=args.lora_scale)
+    pipe.transformer.eval()
     pipe = pipe.to("cuda")
 
     low_resolution_image = prepare_image(input_path, resolution)
@@ -183,12 +185,11 @@ def main() -> None:
     with torch.inference_mode():
         result = pipe(
             prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
             image=low_resolution_image,
-            num_inference_steps=args.inference_steps,
+            height=resolution * 4,
+            width=resolution * 4,
+            num_inference_steps=inference_steps,
             guidance_scale=guidance_scale,
-            noise_level=noise_level,
-            eta=eta,
             generator=generator,
         ).images[0]
 

@@ -1,9 +1,9 @@
-"""Train the Stable Diffusion x4 upscaler with grouped policy optimization.
+"""Train FLUX.2 Klein 4B for image upscaling with grouped policy optimization.
 
 The training path implemented here is:
 
     low-resolution image + prompt
-                  -> x4 upscaler
+                  -> FLUX.2 Klein image-conditioned generation
                   -> four stochastic trajectories / images
                   -> image and prompt reward
                   -> group-relative advantages
@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
@@ -37,7 +38,17 @@ from peft import LoraConfig, get_peft_model_state_dict
 from torch import Tensor
 from transformers import CLIPModel, CLIPProcessor
 
-from diffusers import DDIMScheduler, StableDiffusionUpscalePipeline
+from diffusers import Flux2KleinPipeline
+
+
+FLUX2_KLEIN_LORA_TARGETS = [
+    "to_k",
+    "to_q",
+    "to_v",
+    "to_out.0",
+    "to_qkv_mlp_proj",
+    *[f"single_transformer_blocks.{index}.attn.to_out" for index in range(24)],
+]
 
 
 # metrics_checker.py находится на один каталог выше текущего обучающего скрипта.
@@ -51,7 +62,7 @@ from metrics_checker import ArtQualityEvaluator
 # Конфигурация всех параметров генерации, награды и обучения Flow-GRPO.
 @dataclass
 class FlowGRPOConfig:
-    model_id: str = "stabilityai/stable-diffusion-x4-upscaler"
+    model_id: str = "black-forest-labs/FLUX.2-klein-4B"
     manifest: str = "flow_grpo_dataset/upscaling_dataset/manifest.json"
     lr_pipeline: str | None = None
     output_dir: str = "flow_grpo_output"
@@ -59,9 +70,8 @@ class FlowGRPOConfig:
     group_size: int = 4
     epochs: int = 1
     grpo_epochs: int = 2
-    inference_steps: int = 20
-    noise_level: int = 20
-    guidance_scale: float = 7.5
+    inference_steps: int = 4
+    guidance_scale: float = 1.0
     eta: float = 1.0
     learning_rate: float = 1.0e-5
     max_grad_norm: float = 1.0
@@ -74,7 +84,7 @@ class FlowGRPOConfig:
     metrics_reward_weight: float = 0.25
     clip_model_id: str | None = "openai/clip-vit-base-patch32"
     reward_device: str = "cpu"
-    mixed_precision: str = "fp16"
+    mixed_precision: str = "bf16"
     save_every: int = 25
     max_samples: int | None = None
     seed: int = 42
@@ -88,17 +98,33 @@ class ManifestRecord:
     reference_path: Path | None
 
 
-# Результат генерации группы изображений вместе с сохранённой DDIM-траекторией.
+# Результат генерации группы изображений вместе с сохранённой flow-траекторией.
 @dataclass
 class Rollout:
-    """A detached rollout; each list entry is one stochastic DDIM transition."""
+    """A detached rollout; each entry is one stochastic flow transition."""
 
     states: list[Tensor]
     next_states: list[Tensor]
-    timesteps: list[int]
-    previous_timesteps: list[int]
+    timesteps: list[float]
+    sigmas: list[float]
+    next_sigmas: list[float]
     old_log_probs: list[Tensor]
+    latent_ids: Tensor
     images: Tensor
+
+
+def _compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
+    """Match the timestep shift used by the FLUX.2 Klein pipeline."""
+
+    short_slope, short_intercept = 8.73809524e-05, 1.89833333
+    long_slope, long_intercept = 0.00016927, 0.45666666
+    if image_seq_len > 4300:
+        return float(long_slope * image_seq_len + long_intercept)
+
+    mu_at_200 = long_slope * image_seq_len + long_intercept
+    mu_at_10 = short_slope * image_seq_len + short_intercept
+    slope = (mu_at_200 - mu_at_10) / 190.0
+    return float(mu_at_200 + (num_steps - 200.0) * slope)
 
 
 def _resolve_manifest_path(value: str, manifest_path: Path) -> Path:
@@ -412,43 +438,44 @@ class FlowGRPOTrainer:
             raise ValueError("GRPO needs at least two outputs in each group.")
         if config.eta <= 0:
             raise ValueError("eta must be positive so that rollout transitions are stochastic.")
-        if config.resolution % 8:
-            raise ValueError("resolution must be divisible by 8.")
+        if config.resolution % 4:
+            raise ValueError("resolution must be divisible by 4.")
 
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type != "cuda":
-            raise RuntimeError("Training the x4 upscaler requires a CUDA GPU.")
+            raise RuntimeError("Training FLUX.2 Klein requires a CUDA GPU.")
 
         dtype_by_name = {"fp16": torch.float16, "bf16": torch.bfloat16}
         self.weight_dtype = dtype_by_name[config.mixed_precision]
         self.generator = torch.Generator(device=self.device).manual_seed(config.seed)
 
-        self.pipe = StableDiffusionUpscalePipeline.from_pretrained(
+        self.pipe = Flux2KleinPipeline.from_pretrained(
             config.model_id,
             torch_dtype=self.weight_dtype,
         ).to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
         self.pipe.vae.enable_slicing()
-        self.pipe.enable_attention_slicing()
         self.pipe.vae.requires_grad_(False).eval()
         self.pipe.text_encoder.requires_grad_(False).eval()
-        self.pipe.unet.requires_grad_(False)
+        self.pipe.transformer.requires_grad_(False)
 
         lora_config = LoraConfig(
             r=config.lora_rank,
             lora_alpha=config.lora_rank,
             init_lora_weights="gaussian",
-            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+            target_modules=FLUX2_KLEIN_LORA_TARGETS,
         )
-        self.pipe.unet.add_adapter(lora_config)
-        self.pipe.unet.enable_gradient_checkpointing()
-        for parameter in self.pipe.unet.parameters():
+        self.pipe.transformer.add_adapter(lora_config)
+        self.pipe.transformer.enable_gradient_checkpointing()
+        for parameter in self.pipe.transformer.parameters():
             if parameter.requires_grad:
                 parameter.data = parameter.data.float()
 
         self.trainable_parameters = [
-            parameter for parameter in self.pipe.unet.parameters() if parameter.requires_grad
+            parameter
+            for parameter in self.pipe.transformer.parameters()
+            if parameter.requires_grad
         ]
         if not self.trainable_parameters:
             raise RuntimeError("No trainable LoRA parameters were created.")
@@ -460,7 +487,7 @@ class FlowGRPOTrainer:
             weight_decay=1.0e-2,
         )
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.weight_dtype == torch.float16)
-        self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self.scheduler = self.pipe.scheduler
         self.reward = UpscalingReward(config)
         self.global_step = 0
 
@@ -477,116 +504,87 @@ class FlowGRPOTrainer:
         return image_tensor.to(device=self.device, dtype=self.weight_dtype)
 
     @torch.no_grad()
-    def _encode_prompt(self, prompt: str) -> Tensor:
-        tokenizer = self.pipe.tokenizer
-        text_encoder = self.pipe.text_encoder
-
-        def encode(text: str) -> Tensor:
-            tokens = tokenizer(
-                [text],
-                padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-            return text_encoder(tokens.input_ids.to(self.device))[0]
-
-        conditional = encode(prompt).repeat(self.config.group_size, 1, 1)
-        unconditional = encode("").repeat(self.config.group_size, 1, 1)
-        return torch.cat([unconditional, conditional], dim=0)
-
-    def _prepare_condition(self, image: Tensor) -> tuple[Tensor, Tensor]:
-        noise_level = torch.tensor(
-            [self.config.noise_level], device=self.device, dtype=torch.long
+    def _encode_prompt(self, prompt: str) -> tuple[Tensor, Tensor]:
+        return self.pipe.encode_prompt(
+            prompt=[prompt] * self.config.group_size,
+            device=self.device,
+            num_images_per_prompt=1,
         )
-        noise = torch.randn(
-            image.shape,
+
+    @torch.no_grad()
+    def _prepare_condition(self, image: Tensor) -> tuple[Tensor, Tensor]:
+        return self.pipe.prepare_image_latents(
+            images=[image],
+            batch_size=self.config.group_size,
             generator=self.generator,
             device=self.device,
-            dtype=image.dtype,
+            dtype=self.pipe.vae.dtype,
         )
-        noisy_image = self.pipe.low_res_scheduler.add_noise(image, noise, noise_level)
-        noisy_image = noisy_image.repeat(self.config.group_size, 1, 1, 1)
-        class_labels = noise_level.repeat(self.config.group_size)
-        return noisy_image, class_labels
 
-    def _predict_noise(
+    def _predict_velocity(
         self,
         latents: Tensor,
-        timestep: int,
-        image_condition: Tensor,
-        class_labels: Tensor,
+        timestep: float,
+        latent_ids: Tensor,
+        image_latents: Tensor,
+        image_latent_ids: Tensor,
         prompt_embeddings: Tensor,
+        text_ids: Tensor,
     ) -> Tensor:
-        timestep_tensor = torch.tensor(timestep, device=self.device, dtype=torch.long)
-        latent_input = torch.cat([latents, latents], dim=0)
-        latent_input = self.scheduler.scale_model_input(latent_input, timestep_tensor)
-        model_input = torch.cat(
-            [latent_input, torch.cat([image_condition, image_condition], dim=0)], dim=1
+        timestep_tensor = torch.full(
+            (latents.shape[0],),
+            timestep / 1000.0,
+            device=self.device,
+            dtype=latents.dtype,
         )
-        labels = torch.cat([class_labels, class_labels], dim=0)
-        prediction = self.pipe.unet(
-            model_input,
-            timestep_tensor,
+        model_input = torch.cat([latents, image_latents], dim=1).to(
+            self.pipe.transformer.dtype
+        )
+        model_image_ids = torch.cat([latent_ids, image_latent_ids], dim=1)
+        prediction = self.pipe.transformer(
+            hidden_states=model_input,
+            timestep=timestep_tensor,
+            guidance=None,
             encoder_hidden_states=prompt_embeddings,
-            class_labels=labels,
+            txt_ids=text_ids,
+            img_ids=model_image_ids,
+            joint_attention_kwargs=None,
             return_dict=False,
         )[0]
-        unconditional, conditional = prediction.chunk(2)
-        return unconditional + self.config.guidance_scale * (conditional - unconditional)
+        return prediction[:, : latents.shape[1]]
 
-    def _ddim_mean_and_std(
+    def _flow_mean_and_std(
         self,
         model_output: Tensor,
-        timestep: int,
-        previous_timestep: int,
+        sigma: float,
+        next_sigma: float,
         sample: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        # Scheduler coefficients become numerically unstable in fp16 near the
-        # final denoising timestep (alpha is close to 1 and beta is close to
-        # zero). Keep the inexpensive DDIM scalar/tensor arithmetic in fp32;
-        # gradients still flow back through the cast to the fp16 UNet output.
+        """Return the stochastic Euler-ancestral flow transition parameters."""
+
         output_dtype = sample.dtype
         sample = sample.float()
         model_output = model_output.float()
-        alphas = self.scheduler.alphas_cumprod
-        alpha_t = alphas[timestep].to(device=sample.device, dtype=torch.float32)
-        if previous_timestep >= 0:
-            alpha_previous = alphas[previous_timestep].to(
-                device=sample.device, dtype=torch.float32
-            )
+        sigma_tensor = torch.as_tensor(sigma, device=sample.device, dtype=torch.float32)
+        next_sigma_tensor = torch.as_tensor(
+            next_sigma, device=sample.device, dtype=torch.float32
+        )
+
+        if next_sigma <= 0.0:
+            sigma_up = torch.zeros_like(next_sigma_tensor)
         else:
-            alpha_previous = self.scheduler.final_alpha_cumprod.to(
-                device=sample.device, dtype=torch.float32
+            variance = (
+                next_sigma_tensor.square()
+                * (sigma_tensor.square() - next_sigma_tensor.square()).clamp_min(0)
+                / sigma_tensor.square().clamp_min(1.0e-12)
             )
-
-        beta_t = 1 - alpha_t
-        prediction_type = self.scheduler.config.prediction_type
-        if prediction_type == "epsilon":
-            predicted_original = (sample - beta_t.sqrt() * model_output) / alpha_t.sqrt()
-            predicted_epsilon = model_output
-        elif prediction_type == "sample":
-            predicted_original = model_output
-            predicted_epsilon = (sample - alpha_t.sqrt() * predicted_original) / beta_t.sqrt()
-        elif prediction_type == "v_prediction":
-            predicted_original = alpha_t.sqrt() * sample - beta_t.sqrt() * model_output
-            predicted_epsilon = alpha_t.sqrt() * model_output + beta_t.sqrt() * sample
-        else:
-            raise ValueError(f"Unsupported prediction type: {prediction_type}")
-
-        if self.scheduler.config.thresholding:
-            predicted_original = self.scheduler._threshold_sample(predicted_original)
-        elif self.scheduler.config.clip_sample:
-            clip_range = self.scheduler.config.clip_sample_range
-            predicted_original = predicted_original.clamp(-clip_range, clip_range)
-
-        beta_previous = 1 - alpha_previous
-        variance = (beta_previous / beta_t) * (1 - alpha_t / alpha_previous)
-        variance = variance.clamp_min(0)
-        standard_deviation = self.config.eta * variance.sqrt()
-        direction_scale = (1 - alpha_previous - standard_deviation.square()).clamp_min(0).sqrt()
-        mean = alpha_previous.sqrt() * predicted_original + direction_scale * predicted_epsilon
-        return mean.to(output_dtype), standard_deviation.to(output_dtype)
+            sigma_up = torch.minimum(
+                next_sigma_tensor,
+                self.config.eta * variance.sqrt(),
+            )
+        sigma_down = (next_sigma_tensor.square() - sigma_up.square()).clamp_min(0).sqrt()
+        mean = sample + (sigma_down - sigma_tensor) * model_output
+        return mean.to(output_dtype), sigma_up.to(output_dtype)
 
     @staticmethod
     def _transition_log_probability(value: Tensor, mean: Tensor, std: Tensor) -> Tensor:
@@ -597,56 +595,110 @@ class FlowGRPOTrainer:
         return log_probability.flatten(1).mean(dim=1)
 
     @torch.no_grad()
+    def _decode_latents(
+        self,
+        latents: Tensor,
+        latent_ids: Tensor,
+        height: int,
+        width: int,
+    ) -> Tensor:
+        latent_height = 2 * (height // (self.pipe.vae_scale_factor * 2))
+        latent_width = 2 * (width // (self.pipe.vae_scale_factor * 2))
+        latents = self.pipe._unpack_latents_with_ids(
+            latents,
+            latent_ids,
+            latent_height // 2,
+            latent_width // 2,
+        )
+        batch_norm_mean = self.pipe.vae.bn.running_mean.view(1, -1, 1, 1).to(
+            latents.device, latents.dtype
+        )
+        batch_norm_std = torch.sqrt(
+            self.pipe.vae.bn.running_var.view(1, -1, 1, 1)
+            + self.pipe.vae.config.batch_norm_eps
+        ).to(latents.device, latents.dtype)
+        latents = self.pipe._unpatchify_latents(
+            latents * batch_norm_std + batch_norm_mean
+        )
+        decoded = self.pipe.vae.decode(latents, return_dict=False)[0]
+        if not torch.isfinite(decoded).all():
+            raise FloatingPointError("VAE decoder produced non-finite values.")
+        images = self.pipe.image_processor.postprocess(decoded, output_type="pt")
+        return images.float().cpu()
+
+    @torch.no_grad()
     def _rollout(
         self,
-        image_condition: Tensor,
-        class_labels: Tensor,
+        image_latents: Tensor,
+        image_latent_ids: Tensor,
         prompt_embeddings: Tensor,
+        text_ids: Tensor,
     ) -> Rollout:
-        self.pipe.unet.eval()
-        self.scheduler.set_timesteps(self.config.inference_steps, device=self.device)
-        timesteps = [int(value) for value in self.scheduler.timesteps]
-
-        latent_channels = self.pipe.unet.config.in_channels - image_condition.shape[1]
-        shape = (
-            self.config.group_size,
-            latent_channels,
-            image_condition.shape[-2],
-            image_condition.shape[-1],
-        )
-        latents = torch.randn(
-            shape,
-            generator=self.generator,
+        self.pipe.transformer.eval()
+        target_resolution = self.config.resolution * 4
+        latent_channels = self.pipe.transformer.config.in_channels // 4
+        latents, latent_ids = self.pipe.prepare_latents(
+            batch_size=self.config.group_size,
+            num_latents_channels=latent_channels,
+            height=target_resolution,
+            width=target_resolution,
+            dtype=prompt_embeddings.dtype,
             device=self.device,
-            dtype=self.weight_dtype,
+            generator=self.generator,
         )
-        latents = latents * self.scheduler.init_noise_sigma
+
+        image_seq_len = latents.shape[1]
+        step_count = self.config.inference_steps
+        mu = _compute_empirical_mu(image_seq_len, step_count)
+        if getattr(self.scheduler.config, "use_flow_sigmas", False):
+            self.scheduler.set_timesteps(
+                step_count,
+                device=self.device,
+                mu=mu,
+            )
+        else:
+            flow_sigmas = np.linspace(1.0, 1.0 / step_count, step_count)
+            self.scheduler.set_timesteps(
+                sigmas=flow_sigmas,
+                device=self.device,
+                mu=mu,
+            )
+        timesteps = [float(value) for value in self.scheduler.timesteps]
+        sigmas = [float(value) for value in self.scheduler.sigmas]
+        if len(sigmas) != len(timesteps) + 1:
+            raise RuntimeError(
+                "FLUX scheduler must provide one more sigma than timestep."
+            )
 
         states: list[Tensor] = []
         next_states: list[Tensor] = []
-        stored_timesteps: list[int] = []
-        stored_previous_timesteps: list[int] = []
+        stored_timesteps: list[float] = []
+        stored_sigmas: list[float] = []
+        stored_next_sigmas: list[float] = []
         old_log_probs: list[Tensor] = []
 
         for index, timestep in enumerate(timesteps):
-            previous_timestep = timesteps[index + 1] if index + 1 < len(timesteps) else -1
-            model_output = self._predict_noise(
+            sigma = sigmas[index]
+            next_sigma = sigmas[index + 1]
+            model_output = self._predict_velocity(
                 latents,
                 timestep,
-                image_condition,
-                class_labels,
+                latent_ids,
+                image_latents,
+                image_latent_ids,
                 prompt_embeddings,
+                text_ids,
             )
             if not torch.isfinite(model_output).all():
                 raise FloatingPointError(
-                    f"UNet produced non-finite values at timestep {timestep}."
+                    f"FLUX transformer produced non-finite values at timestep {timestep}."
                 )
-            mean, std = self._ddim_mean_and_std(
-                model_output, timestep, previous_timestep, latents
+            mean, std = self._flow_mean_and_std(
+                model_output, sigma, next_sigma, latents
             )
             if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
                 raise FloatingPointError(
-                    f"DDIM transition produced non-finite values at timestep {timestep}."
+                    f"Flow transition produced non-finite values at timestep {timestep}."
                 )
 
             if float(std) > 0:
@@ -660,7 +712,8 @@ class FlowGRPOTrainer:
                 states.append(latents.cpu())
                 next_states.append(next_latents.cpu())
                 stored_timesteps.append(timestep)
-                stored_previous_timesteps.append(previous_timestep)
+                stored_sigmas.append(sigma)
+                stored_next_sigmas.append(next_sigma)
                 old_log_probs.append(
                     self._transition_log_probability(next_latents, mean, std).float().cpu()
                 )
@@ -668,27 +721,20 @@ class FlowGRPOTrainer:
                 next_latents = mean
             latents = next_latents
 
-        needs_upcasting = (
-            self.pipe.vae.dtype == torch.float16
-            and getattr(self.pipe.vae.config, "force_upcast", False)
+        images = self._decode_latents(
+            latents,
+            latent_ids,
+            target_resolution,
+            target_resolution,
         )
-        if needs_upcasting:
-            self.pipe.vae.to(dtype=torch.float32)
-            latents = latents.float()
-        decoded = self.pipe.vae.decode(
-            latents / self.pipe.vae.config.scaling_factor, return_dict=False
-        )[0]
-        if not torch.isfinite(decoded).all():
-            raise FloatingPointError("VAE decoder produced non-finite values.")
-        if needs_upcasting:
-            self.pipe.vae.to(dtype=self.weight_dtype)
-        images = decoded.add(1).div(2).clamp(0, 1).float().cpu()
         return Rollout(
             states=states,
             next_states=next_states,
             timesteps=stored_timesteps,
-            previous_timesteps=stored_previous_timesteps,
+            sigmas=stored_sigmas,
+            next_sigmas=stored_next_sigmas,
             old_log_probs=old_log_probs,
+            latent_ids=latent_ids.cpu(),
             images=images,
         )
 
@@ -696,16 +742,18 @@ class FlowGRPOTrainer:
         self,
         rollout: Rollout,
         advantages: Tensor,
-        image_condition: Tensor,
-        class_labels: Tensor,
+        image_latents: Tensor,
+        image_latent_ids: Tensor,
         prompt_embeddings: Tensor,
+        text_ids: Tensor,
     ) -> dict[str, float]:
         if not rollout.states:
             raise RuntimeError("No stochastic transitions were produced for the GRPO update.")
 
         metrics = {"loss": 0.0, "approx_kl": 0.0, "clip_fraction": 0.0}
         updates = 0
-        self.pipe.unet.train()
+        self.pipe.transformer.train()
+        latent_ids = rollout.latent_ids.to(self.device)
 
         for _ in range(self.config.grpo_epochs):
             self.optimizer.zero_grad(set_to_none=True)
@@ -713,11 +761,12 @@ class FlowGRPOTrainer:
             epoch_kl = 0.0
             epoch_clip_fraction = 0.0
 
-            for state_cpu, next_state_cpu, timestep, previous_timestep, old_log_prob_cpu in zip(
+            for state_cpu, next_state_cpu, timestep, sigma, next_sigma, old_log_prob_cpu in zip(
                 rollout.states,
                 rollout.next_states,
                 rollout.timesteps,
-                rollout.previous_timesteps,
+                rollout.sigmas,
+                rollout.next_sigmas,
                 rollout.old_log_probs,
             ):
                 state = state_cpu.to(self.device, dtype=self.weight_dtype)
@@ -727,15 +776,17 @@ class FlowGRPOTrainer:
                 with torch.autocast(
                     device_type="cuda", dtype=self.weight_dtype, enabled=True
                 ):
-                    model_output = self._predict_noise(
+                    model_output = self._predict_velocity(
                         state,
                         timestep,
-                        image_condition,
-                        class_labels,
+                        latent_ids,
+                        image_latents,
+                        image_latent_ids,
                         prompt_embeddings,
+                        text_ids,
                     )
-                    mean, std = self._ddim_mean_and_std(
-                        model_output, timestep, previous_timestep, state
+                    mean, std = self._flow_mean_and_std(
+                        model_output, sigma, next_sigma, state
                     )
                     new_log_probability = self._transition_log_probability(
                         next_state, mean, std
@@ -778,9 +829,11 @@ class FlowGRPOTrainer:
         state = {
             "step": self.global_step,
             "config": asdict(self.config),
-            "unet_lora": {
+            "transformer_lora": {
                 key: value.detach().cpu()
-                for key, value in get_peft_model_state_dict(self.pipe.unet).items()
+                for key, value in get_peft_model_state_dict(
+                    self.pipe.transformer
+                ).items()
             },
         }
         torch.save(state, checkpoint_dir / "flow_grpo_lora.pt")
@@ -797,11 +850,16 @@ class FlowGRPOTrainer:
 
             for record in epoch_records:
                 low_resolution = self._prepare_low_resolution_image(record.lr_path)
-                prompt_embeddings = self._encode_prompt(record.prompt)
-                image_condition, class_labels = self._prepare_condition(low_resolution)
+                prompt_embeddings, text_ids = self._encode_prompt(record.prompt)
+                image_latents, image_latent_ids = self._prepare_condition(
+                    low_resolution
+                )
 
                 rollout = self._rollout(
-                    image_condition, class_labels, prompt_embeddings
+                    image_latents,
+                    image_latent_ids,
+                    prompt_embeddings,
+                    text_ids,
                 )
                 rewards, reward_parts = self.reward(
                     rollout.images,
@@ -817,9 +875,10 @@ class FlowGRPOTrainer:
                 update_metrics = self._grpo_update(
                     rollout,
                     advantages,
-                    image_condition,
-                    class_labels,
+                    image_latents,
+                    image_latent_ids,
                     prompt_embeddings,
+                    text_ids,
                 )
                 self.global_step += 1
 
@@ -857,14 +916,13 @@ def parse_args() -> FlowGRPOConfig:
         ),
     )
     parser.add_argument("--output-dir", default="flow_grpo_output")
-    parser.add_argument("--model-id", default="stabilityai/stable-diffusion-x4-upscaler")
+    parser.add_argument("--model-id", default="black-forest-labs/FLUX.2-klein-4B")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--grpo-epochs", type=int, default=2)
     parser.add_argument("--group-size", type=int, default=4)
-    parser.add_argument("--inference-steps", type=int, default=20)
+    parser.add_argument("--inference-steps", type=int, default=4)
     parser.add_argument("--resolution", type=int, default=120)
-    parser.add_argument("--noise-level", type=int, default=20)
-    parser.add_argument("--guidance-scale", type=float, default=7.5)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=1.0e-5)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
@@ -875,7 +933,7 @@ def parse_args() -> FlowGRPOConfig:
     parser.add_argument("--metrics-reward-weight", type=float, default=0.25)
     parser.add_argument("--clip-model-id", default="openai/clip-vit-base-patch32")
     parser.add_argument("--reward-device", default="cpu")
-    parser.add_argument("--mixed-precision", choices=["fp16", "bf16"], default="fp16")
+    parser.add_argument("--mixed-precision", choices=["fp16", "bf16"], default="bf16")
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--seed", type=int, default=42)
@@ -892,7 +950,6 @@ def parse_args() -> FlowGRPOConfig:
         epochs=args.epochs,
         grpo_epochs=args.grpo_epochs,
         inference_steps=args.inference_steps,
-        noise_level=args.noise_level,
         guidance_scale=args.guidance_scale,
         eta=args.eta,
         learning_rate=args.learning_rate,

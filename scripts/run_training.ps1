@@ -3,12 +3,12 @@ param(
     [int]$Epochs = 1,
     [int]$MaxSamples = 0,
     [int]$GroupSize = 2,
-    [int]$InferenceSteps = 20,
+    [int]$InferenceSteps = 4,
     [int]$Resolution = 120,
     [string]$OutputDirectory = "flow_grpo_output",
     [string]$LrPipeline = "",
     [ValidateSet("fp16", "bf16")]
-    [string]$MixedPrecision = "fp16",
+    [string]$MixedPrecision = "bf16",
     [string]$RewardDevice = "cpu",
     [switch]$DisableClip
 )
@@ -24,8 +24,8 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 if ($GroupSize -lt 2) {
     throw "Flow-GRPO requires GroupSize >= 2"
 }
-if ($Resolution % 8 -ne 0) {
-    throw "Resolution must be divisible by 8"
+if ($Resolution % 4 -ne 0) {
+    throw "Resolution must be divisible by 4"
 }
 
 $env:HF_HOME = Join-Path $cacheDirectory "huggingface"

@@ -47,11 +47,11 @@ try {
         --epochs 1 `
         --grpo-epochs 1 `
         --group-size 2 `
-        --inference-steps 5 `
+        --inference-steps 4 `
         --resolution $Resolution `
         --save-every 1 `
         --reward-device cpu `
-        --mixed-precision fp16 `
+        --mixed-precision bf16 `
         --clip-model-id none
 
     if ($LASTEXITCODE -ne 0) {

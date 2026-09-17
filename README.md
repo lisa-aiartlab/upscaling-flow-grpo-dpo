@@ -1,10 +1,11 @@
 # Flow-GRPO for image upscaling
 
 This repository trains a LoRA adapter for
-`stabilityai/stable-diffusion-x4-upscaler` with grouped relative policy
-optimization (Flow-GRPO). The committed checkout contains the code and both
-training datasets; model weights and Python packages are downloaded on the
-target machine.
+`black-forest-labs/FLUX.2-klein-4B` with grouped relative policy optimization
+(Flow-GRPO). Low-resolution images are supplied as FLUX image references and
+the generated target is four times larger on each side. The committed checkout
+contains the code and both training datasets; model weights and Python packages
+are downloaded on the target machine.
 
 ## Included datasets
 
@@ -20,8 +21,8 @@ inference results are intentionally excluded from Git.
 
 - Linux or Windows with an NVIDIA CUDA-capable GPU.
 - A recent NVIDIA driver.
-- Python 3.8 through 3.11 with `venv` support (3.10 or 3.11 recommended).
-- At least 20 GB of free disk space for the environment, model cache and
+- Python 3.10 or 3.11 with `venv` support.
+- At least 35 GB of free disk space for the environment, model cache and
   checkpoints. More space is useful for long runs.
 - Internet access on first setup to download packages and Hugging Face models.
 
@@ -37,7 +38,8 @@ bash scripts/setup_vm.sh
 bash scripts/run_smoke_training.sh
 ```
 
-The setup script installs the CUDA 12.4 build of PyTorch 2.4.1 by default. To
+The setup script installs the CUDA 12.4 build of PyTorch 2.4.1 by default and
+the Diffusers development branch required by FLUX.2 Klein. To
 use another official PyTorch wheel index, set `TORCH_INDEX_URL` before running
 it:
 
@@ -114,6 +116,6 @@ On a CPU-only machine, dataset and import validation can still be run with
   --output inference_output/upscaled.png
 ```
 
-The first training or inference run downloads the base upscaler and CLIP model
+The first training or inference run downloads FLUX.2 Klein 4B and the CLIP model
 into `.cache/`. Copying only the committed repository is therefore sufficient;
 there is no need to copy the local `.venv` or `.cache` directories.

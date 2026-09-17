@@ -37,8 +37,8 @@ def validate_records(name: str, records: list) -> None:
 
 def main() -> None:
     args = parse_args()
-    if sys.version_info < (3, 8):
-        raise RuntimeError("Python 3.8 or newer is required.")
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Python 3.10 or newer is required.")
 
     paired_manifest = PROJECT_DIRECTORY / "flow_grpo_dataset" / "manifest.json"
     degraded_manifest = (

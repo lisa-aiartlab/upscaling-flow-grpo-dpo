@@ -3,12 +3,13 @@
 torch==2.4.1
 torchvision==0.19.1
 
-# Stable Diffusion x4 upscaler, CLIP reward, and LoRA training.
-diffusers==0.30.3
-transformers==4.44.2
-accelerate==0.34.2
-peft==0.12.0
-safetensors==0.4.5
+# FLUX.2 Klein pipeline, CLIP reward, and transformer LoRA training.
+# Klein support is currently provided by the Diffusers development branch.
+diffusers @ git+https://github.com/huggingface/diffusers.git
+transformers>=4.57.0
+accelerate>=1.10.0
+peft>=0.17.0
+safetensors>=0.6.2
 ftfy==6.2.3
 
 # Image loading, reward metrics, and numerical operations.
