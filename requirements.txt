@@ -1,0 +1,24 @@
+# Install a CUDA-enabled PyTorch build appropriate for the machine when the
+# default PyPI wheel does not match the installed CUDA driver.
+torch==2.4.1
+torchvision==0.19.1
+
+# FLUX.2 Klein pipeline, CLIP reward, and transformer LoRA training.
+# Klein support is currently provided by the Diffusers development branch.
+diffusers @ git+https://github.com/huggingface/diffusers.git
+transformers>=4.57.0
+accelerate>=1.10.0
+peft>=0.17.0
+safetensors>=0.6.2
+ftfy==6.2.3
+
+# Image loading, reward metrics, and numerical operations.
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
+numpy==1.24.4
+
+# Used by the exploratory upscaling notebook.
+matplotlib==3.7.5
+ipykernel==6.29.5
+nbformat==5.10.4
+nbclient==0.10.0

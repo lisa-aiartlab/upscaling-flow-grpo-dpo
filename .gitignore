@@ -209,6 +209,21 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# Project-local state and generated artifacts
+.idea/
+.jupyter/
+data/
+flow_grpo_output*/
+flow_grpo_smoke_output*/
+flow_grpo_launcher_smoke_output/
+inference_output/
+*.pt
+*.safetensors
+upscale_flow_grpo_lora_comparison.ipynb
+scripts/Upscaling_model_basic_pipeline.ipynb
+scripts/create_lora_comparison_notebook.py
+scripts/execute_lora_comparison_notebook.py
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
