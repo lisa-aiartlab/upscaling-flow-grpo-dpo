@@ -1,14 +1,22 @@
 param(
     [string]$Manifest = "flow_grpo_dataset\upscaling_dataset\manifest.json",
     [int]$Epochs = 1,
+    [int]$GrpoEpochs = 1,
     [int]$MaxSamples = 0,
     [int]$GroupSize = 2,
     [int]$InferenceSteps = 4,
-    [int]$Resolution = 120,
+    [int]$Resolution = 128,
+    [double]$LearningRate = 1.0e-5,
+    [double]$MaxGradNorm = 1.0,
+    [double]$ClipEpsilon = 0.2,
+    [double]$AdvantageEpsilon = 1.0e-6,
+    [int]$LoraRank = 4,
+    [int]$SaveEvery = 5,
     [string]$OutputDirectory = "flow_grpo_output",
+    [string]$ResumeFromCheckpoint = "",
     [string]$LrPipeline = "",
     [ValidateSet("fp16", "bf16")]
-    [string]$MixedPrecision = "bf16",
+    [string]$MixedPrecision = "fp16",
     [string]$RewardDevice = "cpu",
     [switch]$DisableClip
 )
@@ -24,8 +32,8 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
 if ($GroupSize -lt 2) {
     throw "Flow-GRPO requires GroupSize >= 2"
 }
-if ($Resolution % 4 -ne 0) {
-    throw "Resolution must be divisible by 4"
+if ($Resolution % 16 -ne 0) {
+    throw "Resolution must be divisible by 16 for FLUX.2 latent packing"
 }
 
 $env:HF_HOME = Join-Path $cacheDirectory "huggingface"
@@ -56,11 +64,16 @@ $trainingArguments = @(
     "--manifest", $Manifest,
     "--output-dir", $OutputDirectory,
     "--epochs", $Epochs,
-    "--grpo-epochs", 1,
+    "--grpo-epochs", $GrpoEpochs,
     "--group-size", $GroupSize,
     "--inference-steps", $InferenceSteps,
     "--resolution", $Resolution,
-    "--save-every", 5,
+    "--learning-rate", $LearningRate,
+    "--max-grad-norm", $MaxGradNorm,
+    "--clip-epsilon", $ClipEpsilon,
+    "--advantage-epsilon", $AdvantageEpsilon,
+    "--lora-rank", $LoraRank,
+    "--save-every", $SaveEvery,
     "--reward-device", $RewardDevice,
     "--mixed-precision", $MixedPrecision
 )
@@ -69,6 +82,9 @@ if ($MaxSamples -gt 0) {
 }
 if ($LrPipeline) {
     $trainingArguments += @("--lr-pipeline", $LrPipeline)
+}
+if ($ResumeFromCheckpoint) {
+    $trainingArguments += @("--resume-from-checkpoint", $ResumeFromCheckpoint)
 }
 if ($DisableClip) {
     $trainingArguments += @("--clip-model-id", "none")

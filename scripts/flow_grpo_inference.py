@@ -46,14 +46,12 @@ from peft import LoraConfig, set_peft_model_state_dict
 from diffusers import Flux2KleinPipeline
 
 
-FLUX2_KLEIN_LORA_TARGETS = [
-    "to_k",
-    "to_q",
-    "to_v",
-    "to_out.0",
-    "to_qkv_mlp_proj",
-    *[f"single_transformer_blocks.{index}.attn.to_out" for index in range(24)],
-]
+FLUX2_KLEIN_LORA_TARGETS = (
+    r"(?:transformer_blocks\.\d+\.attn\.(?:to_q|to_k|to_v|to_out\.0)"
+    r"|single_transformer_blocks\.\d+\.attn\.(?:to_qkv_mlp_proj|to_out))"
+)
+DEFAULT_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_MODEL_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 
 
 DEFAULT_CHECKPOINT = PROJECT_DIRECTORY / "flow_grpo_output" / "final" / "flow_grpo_lora.pt"
@@ -108,6 +106,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT))
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--model-id", help="Override model ID stored in the checkpoint")
+    parser.add_argument(
+        "--model-revision",
+        help="Override the Hugging Face revision stored in the checkpoint",
+    )
     parser.add_argument("--resolution", type=int, help="LR side length; default from checkpoint")
     parser.add_argument("--inference-steps", type=int)
     parser.add_argument("--guidance-scale", type=float, help="Default from checkpoint")
@@ -131,9 +133,12 @@ def main() -> None:
     training_config = checkpoint["config"]
 
     model_id = args.model_id or training_config.get(
-        "model_id", "black-forest-labs/FLUX.2-klein-4B"
+        "model_id", DEFAULT_MODEL_ID
     )
-    resolution = args.resolution or int(training_config.get("resolution", 120))
+    model_revision = args.model_revision or training_config.get(
+        "model_revision", DEFAULT_MODEL_REVISION
+    )
+    resolution = args.resolution or int(training_config.get("resolution", 128))
     guidance_scale = (
         args.guidance_scale
         if args.guidance_scale is not None
@@ -145,14 +150,21 @@ def main() -> None:
         else int(training_config.get("inference_steps", 4))
     )
     lora_rank = int(training_config.get("lora_rank", 4))
-    precision = training_config.get("mixed_precision", "bf16")
+    precision = training_config.get("mixed_precision", "fp16")
+    if precision == "bf16" and not torch.cuda.is_bf16_supported():
+        print(
+            "Checkpoint requests bf16, but this GPU does not support it; "
+            "using fp16 for inference."
+        )
+        precision = "fp16"
     weight_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
 
-    if resolution % 4:
-        raise ValueError("Resolution must be divisible by 4.")
+    if resolution % 16:
+        raise ValueError("Resolution must be divisible by 16 for FLUX.2 latent packing.")
 
     pipe = Flux2KleinPipeline.from_pretrained(
         model_id,
+        revision=model_revision,
         torch_dtype=weight_dtype,
         local_files_only=args.local_files_only,
     )

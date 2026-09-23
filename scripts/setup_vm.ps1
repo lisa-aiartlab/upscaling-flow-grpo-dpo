@@ -1,6 +1,8 @@
 param(
     [string]$Python = "python",
-    [string]$TorchIndexUrl = "https://download.pytorch.org/whl/cu124"
+    [string]$TorchIndexUrl = "https://download.pytorch.org/whl/cu118",
+    [ValidateSet("fp16", "bf16")]
+    [string]$MixedPrecision = "fp16"
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +11,10 @@ $venvPython = Join-Path $projectDirectory ".venv\Scripts\python.exe"
 
 Push-Location $projectDirectory
 try {
+    & $Python -c 'import sys; assert (3, 10) <= sys.version_info[:2] <= (3, 12), "Python 3.10, 3.11, or 3.12 is required"'
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python 3.10, 3.11, or 3.12 is required."
+    }
     if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
         & $Python -m venv .venv
         if ($LASTEXITCODE -ne 0) {
@@ -21,7 +27,7 @@ try {
         throw "Could not upgrade pip tooling."
     }
     & $venvPython -m pip install `
-        torch==2.4.1 torchvision==0.19.1 `
+        torch==2.6.0 torchvision==0.21.0 `
         --index-url $TorchIndexUrl
     if ($LASTEXITCODE -ne 0) {
         throw "Could not install CUDA-enabled PyTorch."
@@ -30,7 +36,11 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Could not install project dependencies."
     }
-    & $venvPython scripts\validate_setup.py
+    & $venvPython -m pip check
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed dependencies are inconsistent."
+    }
+    & $venvPython scripts\validate_setup.py --mixed-precision $MixedPrecision
 
     if ($LASTEXITCODE -ne 0) {
         throw "Environment validation failed."

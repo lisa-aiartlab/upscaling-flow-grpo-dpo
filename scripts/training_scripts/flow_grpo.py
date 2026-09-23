@@ -24,7 +24,10 @@ import argparse
 import csv
 import json
 import math
+import os
 import random
+import re
+import signal
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -34,21 +37,20 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageOps
-from peft import LoraConfig, get_peft_model_state_dict
+from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict
 from torch import Tensor
 from transformers import CLIPModel, CLIPProcessor
 
 from diffusers import Flux2KleinPipeline
 
 
-FLUX2_KLEIN_LORA_TARGETS = [
-    "to_k",
-    "to_q",
-    "to_v",
-    "to_out.0",
-    "to_qkv_mlp_proj",
-    *[f"single_transformer_blocks.{index}.attn.to_out" for index in range(24)],
-]
+FLUX2_KLEIN_LORA_TARGETS = (
+    r"(?:transformer_blocks\.\d+\.attn\.(?:to_q|to_k|to_v|to_out\.0)"
+    r"|single_transformer_blocks\.\d+\.attn\.(?:to_qkv_mlp_proj|to_out))"
+)
+DEFAULT_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
+# Pin model files as well as Python packages so a VM rebuild is reproducible.
+DEFAULT_MODEL_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
 
 
 # metrics_checker.py находится на один каталог выше текущего обучающего скрипта.
@@ -62,12 +64,14 @@ from metrics_checker import ArtQualityEvaluator
 # Конфигурация всех параметров генерации, награды и обучения Flow-GRPO.
 @dataclass
 class FlowGRPOConfig:
-    model_id: str = "black-forest-labs/FLUX.2-klein-4B"
+    model_id: str = DEFAULT_MODEL_ID
+    model_revision: str = DEFAULT_MODEL_REVISION
     manifest: str = "flow_grpo_dataset/upscaling_dataset/manifest.json"
     lr_pipeline: str | None = None
     output_dir: str = "flow_grpo_output"
-    resolution: int = 120
-    group_size: int = 4
+    resume_from_checkpoint: str | None = None
+    resolution: int = 128
+    group_size: int = 2
     epochs: int = 1
     grpo_epochs: int = 2
     inference_steps: int = 4
@@ -84,7 +88,7 @@ class FlowGRPOConfig:
     metrics_reward_weight: float = 0.25
     clip_model_id: str | None = "openai/clip-vit-base-patch32"
     reward_device: str = "cpu"
-    mixed_precision: str = "bf16"
+    mixed_precision: str = "fp16"
     save_every: int = 25
     max_samples: int | None = None
     seed: int = 42
@@ -111,6 +115,10 @@ class Rollout:
     old_log_probs: list[Tensor]
     latent_ids: Tensor
     images: Tensor
+
+
+class ShutdownRequested(RuntimeError):
+    """Raised at a safe point after SIGTERM or SIGINT was received."""
 
 
 def _compute_empirical_mu(image_seq_len: int, num_steps: int) -> float:
@@ -438,13 +446,40 @@ class FlowGRPOTrainer:
             raise ValueError("GRPO needs at least two outputs in each group.")
         if config.eta <= 0:
             raise ValueError("eta must be positive so that rollout transitions are stochastic.")
-        if config.resolution % 4:
-            raise ValueError("resolution must be divisible by 4.")
+        if config.resolution % 16:
+            raise ValueError("resolution must be divisible by 16 for FLUX.2 latent packing.")
+        if config.epochs <= 0 or config.grpo_epochs <= 0:
+            raise ValueError("epochs and grpo_epochs must be positive.")
+        if config.inference_steps < 2:
+            raise ValueError("inference_steps must be at least 2.")
+        if config.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive.")
+        if config.lora_rank <= 0:
+            raise ValueError("lora_rank must be positive.")
+        if config.max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be positive.")
+        if config.advantage_epsilon <= 0:
+            raise ValueError("advantage_epsilon must be positive.")
+        if config.save_every <= 0:
+            raise ValueError("save_every must be positive.")
 
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if self.device.type != "cuda":
             raise RuntimeError("Training FLUX.2 Klein requires a CUDA GPU.")
+        properties = torch.cuda.get_device_properties(self.device)
+        device_arch = f"sm_{properties.major}{properties.minor}"
+        compiled_arches = torch.cuda.get_arch_list()
+        if compiled_arches and device_arch not in compiled_arches:
+            raise RuntimeError(
+                f"The installed PyTorch wheel does not contain {device_arch} kernels "
+                f"for {properties.name}; compiled architectures: {compiled_arches}."
+            )
+        if config.mixed_precision == "bf16" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                f"{properties.name} does not support bf16. Restart with "
+                "--mixed-precision fp16 (required for NVIDIA V100/Volta)."
+            )
 
         dtype_by_name = {"fp16": torch.float16, "bf16": torch.bfloat16}
         self.weight_dtype = dtype_by_name[config.mixed_precision]
@@ -452,6 +487,7 @@ class FlowGRPOTrainer:
 
         self.pipe = Flux2KleinPipeline.from_pretrained(
             config.model_id,
+            revision=config.model_revision,
             torch_dtype=self.weight_dtype,
         ).to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
@@ -459,6 +495,18 @@ class FlowGRPOTrainer:
         self.pipe.vae.requires_grad_(False).eval()
         self.pipe.text_encoder.requires_grad_(False).eval()
         self.pipe.transformer.requires_grad_(False)
+
+        matched_lora_modules = [
+            name
+            for name, module in self.pipe.transformer.named_modules()
+            if re.fullmatch(FLUX2_KLEIN_LORA_TARGETS, name)
+            and isinstance(module, torch.nn.Linear)
+        ]
+        if not matched_lora_modules:
+            raise RuntimeError(
+                "No FLUX.2 transformer modules matched the LoRA target pattern. "
+                "Check the pinned Diffusers/model versions."
+            )
 
         lora_config = LoraConfig(
             r=config.lora_rank,
@@ -480,6 +528,13 @@ class FlowGRPOTrainer:
         if not self.trainable_parameters:
             raise RuntimeError("No trainable LoRA parameters were created.")
 
+        trainable_count = sum(parameter.numel() for parameter in self.trainable_parameters)
+        print(
+            f"LoRA: {len(matched_lora_modules)} modules, "
+            f"{trainable_count:,} trainable parameters",
+            flush=True,
+        )
+
         self.optimizer = torch.optim.AdamW(
             self.trainable_parameters,
             lr=config.learning_rate,
@@ -490,6 +545,128 @@ class FlowGRPOTrainer:
         self.scheduler = self.pipe.scheduler
         self.reward = UpscalingReward(config)
         self.global_step = 0
+        self.next_epoch = 0
+        self.next_record_index = 0
+        self.record_count: int | None = None
+        self.resume_record_count: int | None = None
+        self.shutdown_requested = False
+        self.shutdown_signal: int | None = None
+        self.prompt_cache: dict[str, tuple[Tensor, Tensor]] = {}
+
+        if config.resume_from_checkpoint:
+            self._load_checkpoint(config.resume_from_checkpoint)
+
+    def _handle_shutdown_signal(self, signum: int, _frame: Any) -> None:
+        """Request a checkpoint without doing unsafe I/O inside the handler."""
+
+        if not self.shutdown_requested:
+            self.shutdown_requested = True
+            self.shutdown_signal = signum
+            signal_name = signal.Signals(signum).name
+            print(
+                f"Received {signal_name}; stopping at the nearest safe point "
+                "and saving a shutdown checkpoint.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _raise_if_shutdown_requested(self) -> None:
+        if self.shutdown_requested:
+            raise ShutdownRequested
+
+    @staticmethod
+    def _checkpoint_file(path: str | Path) -> Path:
+        checkpoint_path = Path(path).expanduser()
+        if checkpoint_path.is_dir():
+            checkpoint_path = checkpoint_path / "flow_grpo_lora.pt"
+        return checkpoint_path.resolve()
+
+    def _load_checkpoint(self, path: str | Path) -> None:
+        checkpoint_path = self._checkpoint_file(path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint was not found: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        required_keys = {
+            "config",
+            "transformer_lora",
+            "optimizer",
+            "scaler",
+            "progress",
+            "rng_state",
+        }
+        missing_keys = required_keys.difference(checkpoint)
+        if missing_keys:
+            raise ValueError(
+                "Checkpoint cannot be resumed exactly; missing keys: "
+                f"{sorted(missing_keys)}. Legacy LoRA-only checkpoints can still "
+                "be used for inference."
+            )
+
+        saved_config = checkpoint["config"]
+        for key in (
+            "model_id",
+            "model_revision",
+            "lora_rank",
+            "mixed_precision",
+            "manifest",
+            "lr_pipeline",
+            "max_samples",
+            "seed",
+        ):
+            saved_value = saved_config.get(
+                key,
+                DEFAULT_MODEL_REVISION if key == "model_revision" else None,
+            )
+            current_value = getattr(self.config, key)
+            if saved_value != current_value:
+                raise ValueError(
+                    f"Resume checkpoint has {key}={saved_value!r}, but the current "
+                    f"run requested {current_value!r}."
+                )
+
+        incompatible = set_peft_model_state_dict(
+            self.pipe.transformer,
+            checkpoint["transformer_lora"],
+            adapter_name="default",
+        )
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                "Unexpected LoRA keys in resume checkpoint: "
+                + ", ".join(incompatible.unexpected_keys[:5])
+            )
+
+        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        # Allow an explicitly supplied learning rate to be used after resuming.
+        for parameter_group in self.optimizer.param_groups:
+            parameter_group["lr"] = self.config.learning_rate
+        self.scaler.load_state_dict(checkpoint["scaler"])
+
+        progress = checkpoint["progress"]
+        self.global_step = int(progress["global_step"])
+        self.next_epoch = int(progress["next_epoch"])
+        self.next_record_index = int(progress["next_record_index"])
+        saved_record_count = progress.get("record_count")
+        self.resume_record_count = (
+            int(saved_record_count) if saved_record_count is not None else None
+        )
+
+        rng_state = checkpoint["rng_state"]
+        random.setstate(rng_state["python"])
+        np.random.set_state(rng_state["numpy"])
+        torch.set_rng_state(rng_state["torch"])
+        self.generator.set_state(rng_state["generator"])
+        for device_index, cuda_state in enumerate(rng_state.get("cuda", [])):
+            if device_index >= torch.cuda.device_count():
+                break
+            torch.cuda.set_rng_state(cuda_state, device=device_index)
+
+        print(
+            f"Resumed checkpoint {checkpoint_path}: step={self.global_step}, "
+            f"next_epoch={self.next_epoch + 1}, "
+            f"next_record={self.next_record_index + 1}",
+            flush=True,
+        )
 
     def _prepare_low_resolution_image(self, path: Path) -> Tensor:
         if not path.exists():
@@ -505,11 +682,38 @@ class FlowGRPOTrainer:
 
     @torch.no_grad()
     def _encode_prompt(self, prompt: str) -> tuple[Tensor, Tensor]:
-        return self.pipe.encode_prompt(
-            prompt=[prompt] * self.config.group_size,
-            device=self.device,
-            num_images_per_prompt=1,
+        if prompt not in self.prompt_cache:
+            raise RuntimeError(
+                "Prompt embeddings were not cached before training started."
+            )
+        prompt_embeddings, text_ids = self.prompt_cache[prompt]
+        return (
+            prompt_embeddings.to(self.device).repeat(self.config.group_size, 1, 1),
+            text_ids.to(self.device).repeat(self.config.group_size, 1, 1),
         )
+
+    @torch.no_grad()
+    def _cache_prompt_embeddings(self, records: list[ManifestRecord]) -> None:
+        """Encode every distinct prompt once, then free text-encoder VRAM."""
+
+        unique_prompts = list(dict.fromkeys(record.prompt for record in records))
+        print(f"Caching {len(unique_prompts)} unique prompt embeddings...", flush=True)
+        self.pipe.text_encoder.eval().to(self.device)
+        for prompt in unique_prompts:
+            self._raise_if_shutdown_requested()
+            prompt_embeddings, text_ids = self.pipe.encode_prompt(
+                prompt=prompt,
+                device=self.device,
+                num_images_per_prompt=1,
+            )
+            self.prompt_cache[prompt] = (
+                prompt_embeddings.detach().cpu(),
+                text_ids.detach().cpu(),
+            )
+
+        self.pipe.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
+        print("Prompt cache ready; text encoder moved to CPU.", flush=True)
 
     @torch.no_grad()
     def _prepare_condition(self, image: Tensor) -> tuple[Tensor, Tensor]:
@@ -678,6 +882,7 @@ class FlowGRPOTrainer:
         old_log_probs: list[Tensor] = []
 
         for index, timestep in enumerate(timesteps):
+            self._raise_if_shutdown_requested()
             sigma = sigmas[index]
             next_sigma = sigmas[index + 1]
             model_output = self._predict_velocity(
@@ -689,6 +894,7 @@ class FlowGRPOTrainer:
                 prompt_embeddings,
                 text_ids,
             )
+            self._raise_if_shutdown_requested()
             if not torch.isfinite(model_output).all():
                 raise FloatingPointError(
                     f"FLUX transformer produced non-finite values at timestep {timestep}."
@@ -727,6 +933,7 @@ class FlowGRPOTrainer:
             target_resolution,
             target_resolution,
         )
+        self._raise_if_shutdown_requested()
         return Rollout(
             states=states,
             next_states=next_states,
@@ -756,6 +963,10 @@ class FlowGRPOTrainer:
         latent_ids = rollout.latent_ids.to(self.device)
 
         for _ in range(self.config.grpo_epochs):
+            if self.shutdown_requested:
+                if updates == 0:
+                    raise ShutdownRequested
+                break
             self.optimizer.zero_grad(set_to_none=True)
             epoch_loss = 0.0
             epoch_kl = 0.0
@@ -769,6 +980,11 @@ class FlowGRPOTrainer:
                 rollout.next_sigmas,
                 rollout.old_log_probs,
             ):
+                if self.shutdown_requested:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if updates == 0:
+                        raise ShutdownRequested
+                    break
                 state = state_cpu.to(self.device, dtype=self.weight_dtype)
                 next_state = next_state_cpu.to(self.device, dtype=self.weight_dtype)
                 old_log_probability = old_log_prob_cpu.to(self.device)
@@ -808,6 +1024,12 @@ class FlowGRPOTrainer:
                     ((ratio - 1).abs() > self.config.clip_epsilon).float().mean().detach()
                 )
 
+            if self.shutdown_requested:
+                self.optimizer.zero_grad(set_to_none=True)
+                if updates == 0:
+                    raise ShutdownRequested
+                break
+
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 self.trainable_parameters, self.config.max_grad_norm
@@ -821,85 +1043,180 @@ class FlowGRPOTrainer:
             metrics["clip_fraction"] += epoch_clip_fraction / transition_count
             updates += 1
 
+            # An optimizer step is a commit point. If SIGTERM arrived inside
+            # optimizer.step(), keep this update and finish the current record
+            # with fewer GRPO epochs instead of applying it twice after resume.
+            if self.shutdown_requested:
+                break
+
         return {key: value / updates for key, value in metrics.items()}
 
-    def _save_checkpoint(self, name: str) -> Path:
+    def _save_checkpoint(self, name: str, reason: str = "periodic") -> Path:
         checkpoint_dir = Path(self.config.output_dir) / name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         state = {
+            "checkpoint_version": 2,
             "step": self.global_step,
             "config": asdict(self.config),
+            "reason": reason,
             "transformer_lora": {
                 key: value.detach().cpu()
                 for key, value in get_peft_model_state_dict(
                     self.pipe.transformer
                 ).items()
             },
+            "optimizer": self.optimizer.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "progress": {
+                "global_step": self.global_step,
+                "next_epoch": self.next_epoch,
+                "next_record_index": self.next_record_index,
+                "record_count": self.record_count,
+            },
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all(),
+                "generator": self.generator.get_state(),
+            },
         }
-        torch.save(state, checkpoint_dir / "flow_grpo_lora.pt")
+        checkpoint_path = checkpoint_dir / "flow_grpo_lora.pt"
+        temporary_path = checkpoint_dir / "flow_grpo_lora.pt.tmp"
+        torch.save(state, temporary_path)
+        # Keep the previous checkpoint intact if the VM is killed during write.
+        os.replace(temporary_path, checkpoint_path)
         return checkpoint_dir
 
     def train(self, records: list[ManifestRecord]) -> None:
-        random_generator = random.Random(self.config.seed)
+        self.record_count = len(records)
+        if (
+            self.resume_record_count is not None
+            and self.resume_record_count != self.record_count
+        ):
+            raise ValueError(
+                "The resume checkpoint was created with "
+                f"{self.resume_record_count} records, but the current manifest "
+                f"produced {self.record_count}."
+            )
+        if self.next_epoch < 0 or self.next_record_index < 0:
+            raise ValueError("Resume checkpoint contains negative progress indices.")
+        if self.next_record_index > self.record_count:
+            raise ValueError(
+                "Resume checkpoint record index is outside the current dataset."
+            )
+
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        for epoch in range(self.config.epochs):
-            epoch_records = records.copy()
-            random_generator.shuffle(epoch_records)
+        handled_signals = [signal.SIGTERM, signal.SIGINT]
+        previous_handlers = {
+            handled_signal: signal.getsignal(handled_signal)
+            for handled_signal in handled_signals
+        }
+        for handled_signal in handled_signals:
+            signal.signal(handled_signal, self._handle_shutdown_signal)
 
-            for record in epoch_records:
-                low_resolution = self._prepare_low_resolution_image(record.lr_path)
-                prompt_embeddings, text_ids = self._encode_prompt(record.prompt)
-                image_latents, image_latent_ids = self._prepare_condition(
-                    low_resolution
-                )
+        try:
+            self._cache_prompt_embeddings(records)
+            for epoch in range(self.next_epoch, self.config.epochs):
+                epoch_records = records.copy()
+                # This order can be reconstructed from epoch and seed, so a
+                # checkpoint only needs the next record index.
+                random.Random(self.config.seed + epoch).shuffle(epoch_records)
+                start_index = self.next_record_index if epoch == self.next_epoch else 0
 
-                rollout = self._rollout(
-                    image_latents,
-                    image_latent_ids,
-                    prompt_embeddings,
-                    text_ids,
-                )
-                rewards, reward_parts = self.reward(
-                    rollout.images,
-                    low_resolution,
-                    record.prompt,
-                    record.reference_path,
-                )
-                advantages = (rewards - rewards.mean()) / (
-                    rewards.std(unbiased=False) + self.config.advantage_epsilon
-                )
-                advantages = advantages.to(self.device)
+                for record_index in range(start_index, len(epoch_records)):
+                    self._raise_if_shutdown_requested()
+                    record = epoch_records[record_index]
+                    low_resolution = self._prepare_low_resolution_image(record.lr_path)
+                    prompt_embeddings, text_ids = self._encode_prompt(record.prompt)
+                    self._raise_if_shutdown_requested()
+                    image_latents, image_latent_ids = self._prepare_condition(
+                        low_resolution
+                    )
+                    self._raise_if_shutdown_requested()
 
-                update_metrics = self._grpo_update(
-                    rollout,
-                    advantages,
-                    image_latents,
-                    image_latent_ids,
-                    prompt_embeddings,
-                    text_ids,
-                )
-                self.global_step += 1
+                    rollout = self._rollout(
+                        image_latents,
+                        image_latent_ids,
+                        prompt_embeddings,
+                        text_ids,
+                    )
+                    rewards, reward_parts = self.reward(
+                        rollout.images,
+                        low_resolution,
+                        record.prompt,
+                        record.reference_path,
+                    )
+                    self._raise_if_shutdown_requested()
+                    advantages = (rewards - rewards.mean()) / (
+                        rewards.std(unbiased=False) + self.config.advantage_epsilon
+                    )
+                    advantages = advantages.to(self.device)
 
-                reward_text = ", ".join(f"{value:.4f}" for value in rewards.tolist())
-                part_means = ", ".join(
-                    f"{key}={float(value.mean()):.4f}"
-                    for key, value in reward_parts.items()
-                )
-                print(
-                    f"epoch={epoch + 1} step={self.global_step} "
-                    f"rewards=[{reward_text}] {part_means} "
-                    f"loss={update_metrics['loss']:.6f} "
-                    f"kl={update_metrics['approx_kl']:.6f} "
-                    f"clipfrac={update_metrics['clip_fraction']:.4f}"
-                )
+                    update_metrics = self._grpo_update(
+                        rollout,
+                        advantages,
+                        image_latents,
+                        image_latent_ids,
+                        prompt_embeddings,
+                        text_ids,
+                    )
 
-                if self.global_step % self.config.save_every == 0:
-                    self._save_checkpoint(f"checkpoint-{self.global_step}")
+                    # Commit progress only after at least one optimizer step.
+                    self.global_step += 1
+                    next_record_index = record_index + 1
+                    if next_record_index == len(epoch_records):
+                        self.next_epoch = epoch + 1
+                        self.next_record_index = 0
+                    else:
+                        self.next_epoch = epoch
+                        self.next_record_index = next_record_index
 
-        final_path = self._save_checkpoint("final")
-        print(f"Flow-GRPO training finished. LoRA checkpoint: {final_path}")
+                    reward_text = ", ".join(
+                        f"{value:.4f}" for value in rewards.tolist()
+                    )
+                    part_means = ", ".join(
+                        f"{key}={float(value.mean()):.4f}"
+                        for key, value in reward_parts.items()
+                    )
+                    print(
+                        f"epoch={epoch + 1} step={self.global_step} "
+                        f"rewards=[{reward_text}] {part_means} "
+                        f"loss={update_metrics['loss']:.6f} "
+                        f"kl={update_metrics['approx_kl']:.6f} "
+                        f"clipfrac={update_metrics['clip_fraction']:.4f}",
+                        flush=True,
+                    )
+
+                    if self.global_step % self.config.save_every == 0:
+                        self._save_checkpoint(
+                            f"checkpoint-{self.global_step}", reason="periodic"
+                        )
+                    self._raise_if_shutdown_requested()
+
+            final_path = self._save_checkpoint("final", reason="completed")
+            print(
+                f"Flow-GRPO training finished. LoRA checkpoint: {final_path}",
+                flush=True,
+            )
+        except ShutdownRequested:
+            signal_name = (
+                signal.Signals(self.shutdown_signal).name
+                if self.shutdown_signal is not None
+                else "shutdown request"
+            )
+            shutdown_path = self._save_checkpoint(
+                "shutdown", reason=f"received {signal_name}"
+            )
+            print(
+                f"Training stopped safely. Resume checkpoint: {shutdown_path}",
+                flush=True,
+            )
+        finally:
+            for handled_signal, previous_handler in previous_handlers.items():
+                signal.signal(handled_signal, previous_handler)
 
 
 def parse_args() -> FlowGRPOConfig:
@@ -916,16 +1233,30 @@ def parse_args() -> FlowGRPOConfig:
         ),
     )
     parser.add_argument("--output-dir", default="flow_grpo_output")
-    parser.add_argument("--model-id", default="black-forest-labs/FLUX.2-klein-4B")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        help=(
+            "Checkpoint file or directory created by this trainer. Restores "
+            "LoRA, optimizer, scaler, RNG state, epoch, and dataset position."
+        ),
+    )
+    parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--model-revision",
+        default=DEFAULT_MODEL_REVISION,
+        help="Hugging Face commit/tag for reproducible base-model loading.",
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--grpo-epochs", type=int, default=2)
-    parser.add_argument("--group-size", type=int, default=4)
+    parser.add_argument("--group-size", type=int, default=2)
     parser.add_argument("--inference-steps", type=int, default=4)
-    parser.add_argument("--resolution", type=int, default=120)
+    parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--eta", type=float, default=1.0)
     parser.add_argument("--learning-rate", type=float, default=1.0e-5)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--clip-epsilon", type=float, default=0.2)
+    parser.add_argument("--advantage-epsilon", type=float, default=1.0e-6)
     parser.add_argument("--lora-rank", type=int, default=4)
     parser.add_argument("--prompt-reward-weight", type=float, default=1.0)
     parser.add_argument("--fidelity-reward-weight", type=float, default=1.0)
@@ -933,7 +1264,7 @@ def parse_args() -> FlowGRPOConfig:
     parser.add_argument("--metrics-reward-weight", type=float, default=0.25)
     parser.add_argument("--clip-model-id", default="openai/clip-vit-base-patch32")
     parser.add_argument("--reward-device", default="cpu")
-    parser.add_argument("--mixed-precision", choices=["fp16", "bf16"], default="bf16")
+    parser.add_argument("--mixed-precision", choices=["fp16", "bf16"], default="fp16")
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--seed", type=int, default=42)
@@ -942,9 +1273,11 @@ def parse_args() -> FlowGRPOConfig:
     clip_model_id = None if args.clip_model_id.lower() == "none" else args.clip_model_id
     return FlowGRPOConfig(
         model_id=args.model_id,
+        model_revision=args.model_revision,
         manifest=args.manifest,
         lr_pipeline=args.lr_pipeline,
         output_dir=args.output_dir,
+        resume_from_checkpoint=args.resume_from_checkpoint,
         resolution=args.resolution,
         group_size=args.group_size,
         epochs=args.epochs,
@@ -953,7 +1286,9 @@ def parse_args() -> FlowGRPOConfig:
         guidance_scale=args.guidance_scale,
         eta=args.eta,
         learning_rate=args.learning_rate,
+        max_grad_norm=args.max_grad_norm,
         clip_epsilon=args.clip_epsilon,
+        advantage_epsilon=args.advantage_epsilon,
         lora_rank=args.lora_rank,
         prompt_reward_weight=args.prompt_reward_weight,
         fidelity_reward_weight=args.fidelity_reward_weight,

@@ -1,8 +1,10 @@
 param(
     [string]$Manifest = "flow_grpo_dataset\upscaling_dataset\manifest.json",
-    [int]$Resolution = 120,
+    [int]$Resolution = 128,
     [string]$OutputDirectory = "flow_grpo_smoke_output",
-    [string]$LrPipeline = "LR_01_resize"
+    [string]$LrPipeline = "LR_01_resize",
+    [ValidateSet("fp16", "bf16")]
+    [string]$MixedPrecision = "fp16"
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,8 +53,7 @@ try {
         --resolution $Resolution `
         --save-every 1 `
         --reward-device cpu `
-        --mixed-precision bf16 `
-        --clip-model-id none
+        --mixed-precision $MixedPrecision
 
     if ($LASTEXITCODE -ne 0) {
         throw "Smoke training failed with exit code $LASTEXITCODE"
