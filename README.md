@@ -11,16 +11,20 @@ are downloaded on the target machine.
 
 - `flow_grpo_dataset/manifest.json`: 20 curated LR/preferred-image pairs.
 - `flow_grpo_dataset/upscaling_dataset/manifest.json`: 21 HR images with six
-  degradation pipelines. The loader expands this fetched dataset to 126
+  degradation pipelines. The loader expands this bundled dataset to 126
   trainable LR/HR pairs and it is the default used by the launch scripts.
+
+Training reads these committed files directly; it does not fetch a dataset.
+The first smoke run downloads only the pinned FLUX.2 and CLIP model weights.
 
 Generated checkpoints, caches, virtual environments, raw source archives and
 inference results are intentionally excluded from Git.
 
 ## VM requirements
 
-- Linux or Windows with an NVIDIA CUDA-capable GPU. The default profile targets
-  NVIDIA V100/Volta (`sm_70`) with 48 GB VRAM.
+- Linux or Windows with an NVIDIA CUDA-capable GPU. The compatibility profile
+  supports NVIDIA V100/Volta (`sm_70`), which is available with 16 or 32 GB.
+  A 32 GB GPU is the practical minimum to try; 48 GB or more is recommended.
 - A recent NVIDIA driver compatible with the selected PyTorch CUDA wheel.
 - Python 3.10, 3.11 or 3.12 with `venv` support.
 - At least 35 GB of free disk space for the environment, model cache and
@@ -32,7 +36,19 @@ larger groups and is more useful than adding GPUs to the same process.
 
 ## Linux setup and smoke test
 
-From the repository root:
+On Ubuntu, install the host prerequisites, clone the repository onto persistent
+storage, and run setup from the repository root:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv tmux
+git clone https://github.com/lisa-aiartlab/upscaling-flow-grpo-dpo.git
+cd upscaling-flow-grpo-dpo
+```
+
+The setup starts with a preflight check for Python, `nvidia-smi`, an accessible
+GPU and free disk. It then creates `.venv`, installs pinned dependencies, runs
+the reward unit tests, validates both datasets and checks CUDA compatibility:
 
 ```bash
 bash scripts/setup_vm.sh
@@ -66,18 +82,30 @@ kernels. Selecting `bf16` on a V100 fails immediately with a clear error before
 the model is downloaded or training begins.
 
 The smoke run exercises model loading, LoRA injection, image conditioning, the
-real CLIP/metric reward path, backward, optimizer step and checkpoint writing
-on one sample with two generated candidates. It writes
+real CLIP and aligned HR-target reward path, backward, optimizer step and
+checkpoint writing on one sample with two generated candidates. It writes
 `flow_grpo_smoke_output/final/flow_grpo_lora.pt`.
+
+Do not start full training until that file exists. The model and CLIP downloads
+happen during this command, so the first smoke run can take several minutes.
 
 ## Full Linux training
 
-Train on all 126 fetched LR/HR pairs. The conservative default group size is
+Train on all 126 bundled LR/HR pairs. The conservative default group size is
 2; raise it only after the smoke test succeeds with enough free VRAM:
 
 ```bash
 bash scripts/run_training.sh
 ```
+
+For an SSH session, keep the job alive in `tmux`:
+
+```bash
+tmux new -s flow-grpo
+bash scripts/run_training.sh > training.log 2>&1
+```
+
+Detach with `Ctrl-b d` and reconnect with `tmux attach -t flow-grpo`.
 
 Useful environment overrides:
 
@@ -183,6 +211,26 @@ short run and `-LrPipeline LR_06_realistic` to select one degradation type.
 The validator checks exact dependency versions, required FLUX.2 APIs, free
 disk, every dataset image, CUDA, VRAM and bf16 support. On a CPU-only machine,
 dataset and import validation can still be run with `--allow-no-cuda`.
+
+Reward-only tests can be repeated without loading FLUX weights:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+## Reward definition
+
+Every generated candidate is ranked using prompt CLIP similarity, consistency
+with the LR condition after area downsampling, pixel similarity to the aligned
+HR reference, and HR-target sharpness/saturation error. LR inputs and HR
+references use the same center-crop geometry. Sharpness and saturation are
+matched to the HR target rather than minimized, so the metric does not reward
+blur or suppress legitimate color restoration. If a manifest record has no HR
+reference, the target-dependent reference and quality terms are zero.
+
+The reward definition is versioned in checkpoints. Checkpoints created before
+this target-aware reward update are intentionally rejected for training resume;
+they remain usable by the inference script.
 
 ## Inference with a trained checkpoint
 

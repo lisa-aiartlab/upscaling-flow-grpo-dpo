@@ -140,7 +140,7 @@ def main() -> None:
         load_baseline_manifest(str(paired_manifest), None),
     )
     validate_records(
-        "Fetched degradation dataset",
+        "Bundled degradation dataset",
         load_baseline_manifest(str(degraded_manifest), None),
     )
 
@@ -171,10 +171,10 @@ def main() -> None:
                 f"{properties.name} does not support bf16. Use "
                 "--mixed-precision fp16; this is mandatory for NVIDIA V100/Volta."
             )
-        if total_vram_gb < 20:
+        if total_vram_gb < 32:
             print(
-                "WARNING: less than 20 GB VRAM; even group-size 2 may run out "
-                "of memory with FLUX.2 Klein."
+                "WARNING: less than 32 GB VRAM; the group-size 2 smoke run "
+                "may run out of memory with FLUX.2 Klein LoRA training."
             )
     print("Setup validation passed.")
 
