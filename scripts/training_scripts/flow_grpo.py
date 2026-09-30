@@ -321,6 +321,8 @@ class UpscalingReward:
             images=pil_images,
             return_tensors="pt",
             padding=True,
+            truncation=True,
+            max_length=self.clip_model.config.text_config.max_position_embeddings,
         )
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
         image_features = extract_projected_features(

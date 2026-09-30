@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from metrics_checker import ArtQualityEvaluator, load_aligned_reference
 from model_compat import extract_projected_features
+from training_scripts.flow_grpo import UpscalingReward
 
 
 class UpscalingRewardTests(unittest.TestCase):
@@ -93,6 +94,48 @@ class UpscalingRewardTests(unittest.TestCase):
         actual = extract_projected_features(output)
 
         self.assertIs(actual, expected)
+
+    def test_clip_reward_truncates_prompts_to_model_limit(self) -> None:
+        class RecordingProcessor:
+            def __init__(self) -> None:
+                self.kwargs: dict[str, object] = {}
+
+            def __call__(self, **kwargs: object) -> dict[str, torch.Tensor]:
+                self.kwargs = kwargs
+                sequence_length = int(kwargs["max_length"])
+                return {
+                    "pixel_values": torch.zeros((1, 3, 16, 16)),
+                    "input_ids": torch.zeros((1, sequence_length), dtype=torch.long),
+                    "attention_mask": torch.ones((1, sequence_length), dtype=torch.long),
+                }
+
+        class FakeClipModel:
+            config = SimpleNamespace(
+                text_config=SimpleNamespace(max_position_embeddings=77)
+            )
+
+            @staticmethod
+            def get_image_features(**_: torch.Tensor) -> torch.Tensor:
+                return torch.ones((1, 4))
+
+            @staticmethod
+            def get_text_features(**kwargs: torch.Tensor) -> torch.Tensor:
+                if kwargs["input_ids"].shape[1] > 77:
+                    raise ValueError("prompt exceeded the CLIP context window")
+                return torch.ones((1, 4))
+
+        reward = UpscalingReward.__new__(UpscalingReward)
+        reward.device = torch.device("cpu")
+        reward.clip_processor = RecordingProcessor()
+        reward.clip_model = FakeClipModel()
+
+        scores = reward._prompt_scores(
+            torch.zeros((1, 3, 16, 16)), "long prompt " * 100
+        )
+
+        self.assertEqual(reward.clip_processor.kwargs["max_length"], 77)
+        self.assertIs(reward.clip_processor.kwargs["truncation"], True)
+        torch.testing.assert_close(scores, torch.ones(1))
 
 
 if __name__ == "__main__":
