@@ -51,6 +51,7 @@ FLUX2_KLEIN_LORA_TARGETS = (
 DEFAULT_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
 # Pin model files as well as Python packages so a VM rebuild is reproducible.
 DEFAULT_MODEL_REVISION = "e7b7dc27f91deacad38e78976d1f2b499d76a294"
+REWARD_VERSION = 2
 
 
 # metrics_checker.py находится на один каталог выше текущего обучающего скрипта.
@@ -58,7 +59,7 @@ scripts_directory = Path(__file__).resolve().parents[1]
 if str(scripts_directory) not in sys.path:
     sys.path.insert(0, str(scripts_directory))
 
-from metrics_checker import ArtQualityEvaluator
+from metrics_checker import ArtQualityEvaluator, load_aligned_reference
 
 
 # Конфигурация всех параметров генерации, награды и обучения Flow-GRPO.
@@ -86,6 +87,7 @@ class FlowGRPOConfig:
     fidelity_reward_weight: float = 1.0
     reference_reward_weight: float = 0.25
     metrics_reward_weight: float = 0.25
+    reward_version: int = REWARD_VERSION
     clip_model_id: str | None = "openai/clip-vit-base-patch32"
     reward_device: str = "cpu"
     mixed_precision: str = "fp16"
@@ -293,7 +295,7 @@ def tensor_to_pil(image: Tensor) -> Image.Image:
 
 # Вычисляет общую награду за соответствие промпту, исходному изображению и эталону.
 class UpscalingReward:
-    """Prompt alignment + LR consistency + proximity to the saved baseline."""
+    """Prompt alignment, LR fidelity, and aligned HR-reference quality."""
 
     def __init__(self, config: FlowGRPOConfig):
         self.config = config
@@ -329,69 +331,21 @@ class UpscalingReward:
         text_features = F.normalize(text_features.float(), dim=-1)
         return (image_features * text_features).sum(dim=-1).cpu()
 
-    @staticmethod
-    def _to_uint8_rgb(image: Tensor) -> Any:
-        return (
-            image.detach()
-            .float()
-            .clamp(0, 1)
-            .mul(255)
-            .round()
-            .to(torch.uint8)
-            .permute(1, 2, 0)
-            .contiguous()
-            .cpu()
-            .numpy()
-        )
-
     @torch.no_grad()
     def _metrics_checker_scores(
         self,
         images: Tensor,
-        low_resolution_images: Tensor,
+        reference: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        # Приводим обе стороны к одному размеру, как в evaluate_pair из metrics_checker.py.
-        downscaled_images = F.interpolate(
-            images,
-            size=low_resolution_images.shape[-2:],
-            mode="area",
-        )
-        original = self._to_uint8_rgb(low_resolution_images[0])
-        quality_scores: list[float] = []
-        sharpness_penalties: list[float] = []
-        saturation_penalties: list[float] = []
+        """Reward matching HR sharpness and saturation, not either extreme."""
 
-        # ``strict=`` was added to zip in Python 3.10. These tensors are built
-        # from the same batch, so their lengths are already guaranteed equal.
-        for image, downscaled_image in zip(images, downscaled_images):
-            generated = self._to_uint8_rgb(image)
-            generated_downscaled = self._to_uint8_rgb(downscaled_image)
-            sharpness = self.metrics_evaluator.compute_edge_sharpness_penalty(generated)
-            saturation = self.metrics_evaluator.compute_color_saturation_shift(
-                original, generated_downscaled
-            )
-
-            # Логарифм ограничивает масштаб дисперсии Лапласиана, а насыщенность
-            # переводится из диапазона 0..255 в сопоставимый диапазон 0..1.
-            normalized_sharpness = math.log1p(max(0.0, sharpness)) / 10.0
-            normalized_saturation = max(0.0, saturation) / 255.0
-            sharpness_penalties.append(normalized_sharpness)
-            saturation_penalties.append(normalized_saturation)
-            quality_scores.append(-(normalized_sharpness + normalized_saturation))
-
-        return (
-            torch.tensor(quality_scores, dtype=torch.float32),
-            torch.tensor(sharpness_penalties, dtype=torch.float32),
-            torch.tensor(saturation_penalties, dtype=torch.float32),
+        return self.metrics_evaluator.score_batch_against_reference(
+            images, reference
         )
 
     @staticmethod
     def _load_reference(path: Path, size: tuple[int, int]) -> Tensor:
-        with Image.open(path) as image:
-            image = image.convert("RGB").resize(size, Image.Resampling.LANCZOS)
-            data = torch.frombuffer(bytearray(image.tobytes()), dtype=torch.uint8)
-            data = data.reshape(image.height, image.width, 3)
-        return data.permute(2, 0, 1).float().div(255.0)
+        return load_aligned_reference(path, size)
 
     @torch.no_grad()
     def __call__(
@@ -412,15 +366,19 @@ class UpscalingReward:
             mode="area",
         )
         fidelity_scores = 1.0 - (downscaled - low_resolution_01).square().mean((1, 2, 3))
-        metrics_scores, sharpness_penalties, saturation_penalties = (
-            self._metrics_checker_scores(images_cpu, low_resolution_01)
-        )
-
         reference_scores = torch.zeros_like(fidelity_scores)
-        if reference_path is not None and reference_path.exists():
+        reference: Tensor | None = None
+        if reference_path is not None:
+            if not reference_path.is_file():
+                raise FileNotFoundError(
+                    f"Reward reference image was not found: {reference_path}"
+                )
             width, height = images_cpu.shape[-1], images_cpu.shape[-2]
             reference = self._load_reference(reference_path, (width, height)).unsqueeze(0)
             reference_scores = 1.0 - (images_cpu - reference).square().mean((1, 2, 3))
+        metrics_scores, sharpness_errors, saturation_errors = (
+            self._metrics_checker_scores(images_cpu, reference)
+        )
 
         rewards = (
             self.config.prompt_reward_weight * prompt_scores
@@ -433,8 +391,8 @@ class UpscalingReward:
             "fidelity": fidelity_scores,
             "reference": reference_scores,
             "metrics": metrics_scores,
-            "sharpness_penalty": sharpness_penalties,
-            "saturation_penalty": saturation_penalties,
+            "sharpness_error": sharpness_errors,
+            "saturation_error": saturation_errors,
         }
         return rewards, parts
 
@@ -613,11 +571,20 @@ class FlowGRPOTrainer:
             "lr_pipeline",
             "max_samples",
             "seed",
+            "reward_version",
+            "prompt_reward_weight",
+            "fidelity_reward_weight",
+            "reference_reward_weight",
+            "metrics_reward_weight",
+            "clip_model_id",
         ):
-            saved_value = saved_config.get(
-                key,
-                DEFAULT_MODEL_REVISION if key == "model_revision" else None,
-            )
+            if key == "model_revision":
+                fallback = DEFAULT_MODEL_REVISION
+            elif key == "reward_version":
+                fallback = 1
+            else:
+                fallback = None
+            saved_value = saved_config.get(key, fallback)
             current_value = getattr(self.config, key)
             if saved_value != current_value:
                 raise ValueError(
@@ -1055,7 +1022,7 @@ class FlowGRPOTrainer:
         checkpoint_dir = Path(self.config.output_dir) / name
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         state = {
-            "checkpoint_version": 2,
+            "checkpoint_version": 3,
             "step": self.global_step,
             "config": asdict(self.config),
             "reason": reason,

@@ -4,15 +4,10 @@ set -euo pipefail
 FLOW_GRPO_PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FLOW_GRPO_SYSTEM_PYTHON="${FLOW_GRPO_SYSTEM_PYTHON:-python3}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu118}"
+export FLOW_GRPO_SYSTEM_PYTHON
 
 cd "${FLOW_GRPO_PROJECT_DIR}"
-
-if ! command -v "${FLOW_GRPO_SYSTEM_PYTHON}" >/dev/null 2>&1; then
-  echo "Python executable not found: ${FLOW_GRPO_SYSTEM_PYTHON}" >&2
-  exit 1
-fi
-
-"${FLOW_GRPO_SYSTEM_PYTHON}" -c 'import sys; assert (3, 10) <= sys.version_info[:2] <= (3, 12), "Python 3.10, 3.11, or 3.12 is required"'
+bash scripts/preflight_vm.sh
 
 if [[ ! -x .venv/bin/python ]]; then
   "${FLOW_GRPO_SYSTEM_PYTHON}" -m venv .venv
@@ -25,8 +20,10 @@ source scripts/env.sh
   --index-url "${TORCH_INDEX_URL}"
 "${FLOW_GRPO_PYTHON}" -m pip install -r requirements.txt
 "${FLOW_GRPO_PYTHON}" -m pip check
+"${FLOW_GRPO_PYTHON}" -m unittest discover -s tests -v
 
 "${FLOW_GRPO_PYTHON}" scripts/validate_setup.py \
-  --mixed-precision "${FLOW_GRPO_MIXED_PRECISION:-fp16}"
+  --mixed-precision "${FLOW_GRPO_MIXED_PRECISION:-fp16}" \
+  --minimum-free-disk-gb "${FLOW_GRPO_MINIMUM_FREE_DISK_GB:-35}"
 
 echo "Environment is ready. Run: bash scripts/run_smoke_training.sh"

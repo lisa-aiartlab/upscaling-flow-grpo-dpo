@@ -40,6 +40,10 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Installed dependencies are inconsistent."
     }
+    & $venvPython -m unittest discover -s tests -v
+    if ($LASTEXITCODE -ne 0) {
+        throw "Reward tests failed."
+    }
     & $venvPython scripts\validate_setup.py --mixed-precision $MixedPrecision
 
     if ($LASTEXITCODE -ne 0) {
