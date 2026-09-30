@@ -60,6 +60,7 @@ if str(scripts_directory) not in sys.path:
     sys.path.insert(0, str(scripts_directory))
 
 from metrics_checker import ArtQualityEvaluator, load_aligned_reference
+from model_compat import extract_projected_features
 
 
 # Конфигурация всех параметров генерации, награды и обучения Flow-GRPO.
@@ -322,10 +323,14 @@ class UpscalingReward:
             padding=True,
         )
         inputs = {key: value.to(self.device) for key, value in inputs.items()}
-        image_features = self.clip_model.get_image_features(pixel_values=inputs["pixel_values"])
-        text_features = self.clip_model.get_text_features(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs.get("attention_mask"),
+        image_features = extract_projected_features(
+            self.clip_model.get_image_features(pixel_values=inputs["pixel_values"])
+        )
+        text_features = extract_projected_features(
+            self.clip_model.get_text_features(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs.get("attention_mask"),
+            )
         )
         image_features = F.normalize(image_features.float(), dim=-1)
         text_features = F.normalize(text_features.float(), dim=-1)

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ SCRIPTS_DIRECTORY = PROJECT_DIRECTORY / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIRECTORY))
 
 from metrics_checker import ArtQualityEvaluator, load_aligned_reference
+from model_compat import extract_projected_features
 
 
 class UpscalingRewardTests(unittest.TestCase):
@@ -76,6 +78,21 @@ class UpscalingRewardTests(unittest.TestCase):
         self.assertLess(float(scores[0]), 0.0)
         self.assertEqual(float(sharpness_errors[0]), 0.0)
         self.assertGreater(float(saturation_errors[0]), 0.9)
+
+    def test_clip_feature_compatibility_accepts_transformers_4_tensor(self) -> None:
+        expected = torch.rand((2, 4))
+
+        actual = extract_projected_features(expected)
+
+        self.assertIs(actual, expected)
+
+    def test_clip_feature_compatibility_accepts_transformers_5_output(self) -> None:
+        expected = torch.rand((2, 4))
+        output = SimpleNamespace(pooler_output=expected)
+
+        actual = extract_projected_features(output)
+
+        self.assertIs(actual, expected)
 
 
 if __name__ == "__main__":
