@@ -70,6 +70,8 @@ class FlowGRPOConfig:
     lr_pipeline: str | None = None
     output_dir: str = "flow_grpo_output"
     resume_from_checkpoint: str | None = None
+    # Hybrid (план, эксперимент В): старт Flow-GRPO с LoRA после офлайн-DPO.
+    init_from_lora: str | None = None
     resolution: int = 128
     group_size: int = 2
     epochs: int = 1
@@ -553,6 +555,8 @@ class FlowGRPOTrainer:
         self.shutdown_signal: int | None = None
         self.prompt_cache: dict[str, tuple[Tensor, Tensor]] = {}
 
+        if config.init_from_lora:
+            self._load_lora_weights_only(config.init_from_lora)
         if config.resume_from_checkpoint:
             self._load_checkpoint(config.resume_from_checkpoint)
 
@@ -578,8 +582,57 @@ class FlowGRPOTrainer:
     def _checkpoint_file(path: str | Path) -> Path:
         checkpoint_path = Path(path).expanduser()
         if checkpoint_path.is_dir():
+            for name in ("flow_grpo_lora.pt", "dpo_lora.pt"):
+                candidate = checkpoint_path / name
+                if candidate.is_file():
+                    return candidate.resolve()
             checkpoint_path = checkpoint_path / "flow_grpo_lora.pt"
         return checkpoint_path.resolve()
+
+    def _load_lora_weights_only(self, path: str | Path) -> None:
+        """Load transformer_lora from a DPO or Flow-GRPO checkpoint (Hybrid warm-start)."""
+
+        if self.config.resume_from_checkpoint:
+            raise ValueError(
+                "Use either --init-from-lora or --resume-from-checkpoint, not both."
+            )
+
+        checkpoint_path = self._checkpoint_file(path)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Init LoRA checkpoint was not found: {checkpoint_path}")
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "transformer_lora" not in checkpoint:
+            raise ValueError(f"Checkpoint has no transformer_lora: {checkpoint_path}")
+
+        saved_config = checkpoint.get("config") or {}
+        for key in ("model_id", "model_revision", "lora_rank", "mixed_precision"):
+            if key not in saved_config:
+                continue
+            saved_value = saved_config[key]
+            current_value = getattr(self.config, key)
+            if saved_value != current_value:
+                raise ValueError(
+                    f"Init LoRA checkpoint has {key}={saved_value!r}, but the current "
+                    f"run requested {current_value!r}."
+                )
+
+        incompatible = set_peft_model_state_dict(
+            self.pipe.transformer,
+            checkpoint["transformer_lora"],
+            adapter_name="default",
+        )
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                "Unexpected LoRA keys in init checkpoint: "
+                + ", ".join(incompatible.unexpected_keys[:5])
+            )
+        algorithm = checkpoint.get("algorithm", "unknown")
+        print(
+            f"Initialized LoRA from {checkpoint_path} "
+            f"(source={algorithm}, step={checkpoint.get('step', 'unknown')})",
+            flush=True,
+        )
 
     def _load_checkpoint(self, path: str | Path) -> None:
         checkpoint_path = self._checkpoint_file(path)
@@ -1240,6 +1293,13 @@ def parse_args() -> FlowGRPOConfig:
             "LoRA, optimizer, scaler, RNG state, epoch, and dataset position."
         ),
     )
+    parser.add_argument(
+        "--init-from-lora",
+        help=(
+            "Load only transformer_lora from a DPO or Flow-GRPO checkpoint, "
+            "then start a fresh Flow-GRPO optimizer (Hybrid: DPO → Flow-GRPO)."
+        ),
+    )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument(
         "--model-revision",
@@ -1278,6 +1338,7 @@ def parse_args() -> FlowGRPOConfig:
         lr_pipeline=args.lr_pipeline,
         output_dir=args.output_dir,
         resume_from_checkpoint=args.resume_from_checkpoint,
+        init_from_lora=args.init_from_lora,
         resolution=args.resolution,
         group_size=args.group_size,
         epochs=args.epochs,

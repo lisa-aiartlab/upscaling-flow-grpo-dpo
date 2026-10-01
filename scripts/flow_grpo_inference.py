@@ -1,9 +1,10 @@
-"""Run FLUX.2 Klein 4B upscaling with a trained Flow-GRPO LoRA.
+"""Run FLUX.2 Klein 4B upscaling with a trained Flow-GRPO or Flow-DPO LoRA.
 
 Example:
     python scripts/flow_grpo_inference.py \
         --image flow_grpo_dataset/lr/0001_artwork_26_like.png \
-        --prompt "An eighteenth-century decorative landscape with a river"
+        --prompt "An eighteenth-century decorative landscape with a river" \
+        --checkpoint dpo_output/final
 """
 
 from __future__ import annotations
@@ -65,6 +66,19 @@ def resolve_path(value: str | Path) -> Path:
     return path.resolve()
 
 
+def resolve_checkpoint_path(value: str | Path) -> Path:
+    path = resolve_path(value)
+    if path.is_dir():
+        for name in ("flow_grpo_lora.pt", "dpo_lora.pt"):
+            candidate = path / name
+            if candidate.is_file():
+                return candidate
+        raise FileNotFoundError(
+            f"No flow_grpo_lora.pt or dpo_lora.pt inside checkpoint dir: {path}"
+        )
+    return path
+
+
 def load_checkpoint(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"LoRA checkpoint was not found: {path}")
@@ -74,7 +88,7 @@ def load_checkpoint(path: Path) -> dict[str, Any]:
     missing_keys = required_keys.difference(checkpoint)
     if missing_keys:
         raise ValueError(
-            f"Invalid Flow-GRPO checkpoint; missing keys: {sorted(missing_keys)}"
+            f"Invalid LoRA checkpoint; missing keys: {sorted(missing_keys)}"
         )
 
     state_dict = checkpoint["transformer_lora"]
@@ -126,7 +140,7 @@ def main() -> None:
     if not 0.0 <= args.lora_scale <= 2.0:
         raise ValueError("--lora-scale must be between 0 and 2.")
 
-    checkpoint_path = resolve_path(args.checkpoint)
+    checkpoint_path = resolve_checkpoint_path(args.checkpoint)
     input_path = resolve_path(args.image)
     output_path = resolve_path(args.output)
     checkpoint = load_checkpoint(checkpoint_path)
@@ -207,7 +221,8 @@ def main() -> None:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(output_path)
-    print(f"Loaded Flow-GRPO LoRA: {checkpoint_path}")
+    print(f"Loaded LoRA checkpoint: {checkpoint_path}")
+    print(f"Algorithm: {checkpoint.get('algorithm', 'flow_grpo')}")
     print(f"Checkpoint training step: {checkpoint.get('step', 'unknown')}")
     print(f"LoRA scale: {args.lora_scale}")
     print(f"Input: {input_path} -> {resolution}x{resolution}")

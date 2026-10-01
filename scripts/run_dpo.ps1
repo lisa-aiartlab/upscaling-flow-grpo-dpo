@@ -1,25 +1,21 @@
 param(
-    [string]$Manifest = "flow_grpo_dataset\upscaling_dataset\manifest.json",
+    [string]$Manifest = "flow_grpo_dataset\manifest.json",
     [int]$Epochs = 1,
-    [int]$GrpoEpochs = 1,
     [int]$MaxSamples = 0,
-    [int]$GroupSize = 2,
-    [int]$InferenceSteps = 4,
     [int]$Resolution = 128,
     [double]$LearningRate = 1.0e-5,
     [double]$MaxGradNorm = 1.0,
-    [double]$ClipEpsilon = 0.2,
-    [double]$AdvantageEpsilon = 1.0e-6,
+    [double]$Beta = 500.0,
     [int]$LoraRank = 4,
-    [int]$SaveEvery = 5,
-    [string]$OutputDirectory = "flow_grpo_output",
+    [int]$SaveEvery = 25,
+    [string]$OutputDirectory = "dpo_output",
     [string]$ResumeFromCheckpoint = "",
     [string]$InitFromLora = "",
     [string]$LrPipeline = "",
+    [ValidateSet("lanczos", "bicubic", "nearest")]
+    [string]$SyntheticRejected = "lanczos",
     [ValidateSet("fp16", "bf16")]
-    [string]$MixedPrecision = "fp16",
-    [string]$RewardDevice = "cpu",
-    [switch]$DisableClip
+    [string]$MixedPrecision = "fp16"
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,9 +25,6 @@ $python = Join-Path $projectDirectory ".venv\Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Virtual-environment Python was not found: $python"
-}
-if ($GroupSize -lt 2) {
-    throw "Flow-GRPO requires GroupSize >= 2"
 }
 if ($Resolution % 16 -ne 0) {
     throw "Resolution must be divisible by 16 for FLUX.2 latent packing"
@@ -61,21 +54,17 @@ $env:TOKENIZERS_PARALLELISM = "false"
 }
 
 $trainingArguments = @(
-    "scripts\training_scripts\flow_grpo.py",
+    "scripts\training_scripts\dpo.py",
     "--manifest", $Manifest,
     "--output-dir", $OutputDirectory,
     "--epochs", $Epochs,
-    "--grpo-epochs", $GrpoEpochs,
-    "--group-size", $GroupSize,
-    "--inference-steps", $InferenceSteps,
     "--resolution", $Resolution,
     "--learning-rate", $LearningRate,
     "--max-grad-norm", $MaxGradNorm,
-    "--clip-epsilon", $ClipEpsilon,
-    "--advantage-epsilon", $AdvantageEpsilon,
+    "--beta", $Beta,
     "--lora-rank", $LoraRank,
+    "--synthetic-rejected", $SyntheticRejected,
     "--save-every", $SaveEvery,
-    "--reward-device", $RewardDevice,
     "--mixed-precision", $MixedPrecision
 )
 if ($MaxSamples -gt 0) {
@@ -90,15 +79,12 @@ if ($ResumeFromCheckpoint) {
 if ($InitFromLora) {
     $trainingArguments += @("--init-from-lora", $InitFromLora)
 }
-if ($DisableClip) {
-    $trainingArguments += @("--clip-model-id", "none")
-}
 
 Push-Location $projectDirectory
 try {
     & $python @trainingArguments
     if ($LASTEXITCODE -ne 0) {
-        throw "Training failed with exit code $LASTEXITCODE"
+        throw "DPO training failed with exit code $LASTEXITCODE"
     }
 }
 finally {

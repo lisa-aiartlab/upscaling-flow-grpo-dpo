@@ -41,6 +41,9 @@ fi
 if [[ -n "${FLOW_GRPO_RESUME_FROM_CHECKPOINT:-}" ]]; then
   training_args+=(--resume-from-checkpoint "${FLOW_GRPO_RESUME_FROM_CHECKPOINT}")
 fi
+if [[ -n "${FLOW_GRPO_INIT_FROM_LORA:-}" ]]; then
+  training_args+=(--init-from-lora "${FLOW_GRPO_INIT_FROM_LORA}")
+fi
 
 exec "${FLOW_GRPO_PYTHON}" scripts/training_scripts/flow_grpo.py \
   "${training_args[@]}" "$@"

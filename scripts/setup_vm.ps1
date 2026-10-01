@@ -45,7 +45,13 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Environment validation failed."
     }
-    Write-Output "Environment is ready. Run: .\scripts\run_smoke_training.ps1"
+    Write-Output "Environment is ready."
+    Write-Output "Smoke tests:"
+    Write-Output "  .\scripts\run_smoke_training.ps1"
+    Write-Output "  .\scripts\run_smoke_dpo.ps1"
+    Write-Output "Full training:"
+    Write-Output "  .\scripts\run_training.ps1"
+    Write-Output "  .\scripts\run_dpo.ps1"
 }
 finally {
     Pop-Location

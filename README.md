@@ -1,18 +1,25 @@
-# Flow-GRPO for image upscaling
+# Flow-GRPO and Flow-DPO for image upscaling
 
 This repository trains a LoRA adapter for
-`black-forest-labs/FLUX.2-klein-4B` with grouped relative policy optimization
-(Flow-GRPO). Low-resolution images are supplied as FLUX image references and
-the generated target is four times larger on each side. The committed checkout
-contains the code and both training datasets; model weights and Python packages
-are downloaded on the target machine.
+`black-forest-labs/FLUX.2-klein-4B` with:
+
+- **Flow-GRPO** — online grouped relative policy optimization
+- **Flow-DPO** — offline Direct Preference Optimization on preference pairs
+- **Hybrid** — DPO warm-start, then Flow-GRPO fine-tune
+
+Low-resolution images are supplied as FLUX image references and the generated
+target is four times larger on each side. The committed checkout contains the
+code and both training datasets; model weights and Python packages are
+downloaded on the target machine.
 
 ## Included datasets
 
 - `flow_grpo_dataset/manifest.json`: 20 curated LR/preferred-image pairs.
+  Flow-DPO synthesizes a blurred rejected image from each LR when no
+  `rejected_path` / `y_l` is present.
 - `flow_grpo_dataset/upscaling_dataset/manifest.json`: 21 HR images with six
   degradation pipelines. The loader expands this fetched dataset to 126
-  trainable LR/HR pairs and it is the default used by the launch scripts.
+  trainable LR/HR pairs and it is the default used by the Flow-GRPO launchers.
 
 Generated checkpoints, caches, virtual environments, raw source archives and
 inference results are intentionally excluded from Git.
@@ -37,6 +44,7 @@ From the repository root:
 ```bash
 bash scripts/setup_vm.sh
 bash scripts/run_smoke_training.sh
+bash scripts/run_smoke_dpo.sh
 ```
 
 The setup script installs pinned, mutually compatible dependencies: PyTorch
@@ -59,18 +67,25 @@ underflow. The following is therefore optional but shows the explicit setting:
 ```bash
 FLOW_GRPO_MIXED_PRECISION=fp16 bash scripts/setup_vm.sh
 FLOW_GRPO_MIXED_PRECISION=fp16 bash scripts/run_smoke_training.sh
+DPO_MIXED_PRECISION=fp16 bash scripts/run_smoke_dpo.sh
 ```
 
 The validator also checks that the installed PyTorch wheel contains `sm_70`
 kernels. Selecting `bf16` on a V100 fails immediately with a clear error before
 the model is downloaded or training begins.
 
-The smoke run exercises model loading, LoRA injection, image conditioning, the
-real CLIP/metric reward path, backward, optimizer step and checkpoint writing
-on one sample with two generated candidates. It writes
+The Flow-GRPO smoke run exercises model loading, LoRA injection, image
+conditioning, the real CLIP/metric reward path, backward, optimizer step and
+checkpoint writing on one sample with two generated candidates. It writes
 `flow_grpo_smoke_output/final/flow_grpo_lora.pt`.
 
+The DPO smoke run encodes one preference pair, applies the Flow-DPO logistic
+loss against the frozen reference adapter, and writes
+`dpo_smoke_output/final/dpo_lora.pt`.
+
 ## Full Linux training
+
+### Flow-GRPO (online RL)
 
 Train on all 126 fetched LR/HR pairs. The conservative default group size is
 2; raise it only after the smoke test succeeds with enough free VRAM:
@@ -115,11 +130,68 @@ bash scripts/run_training.sh \
   --save-every 10
 ```
 
+### Flow-DPO (offline preference alignment)
+
+Default curated preference manifest (synthetic blurred `y_l` when no reject
+path is present):
+
+```bash
+bash scripts/run_dpo.sh
+```
+
+Overrides:
+
+```bash
+DPO_MANIFEST=flow_grpo_dataset/upscaling_dataset/manifest.json \
+DPO_LR_PIPELINE=LR_06_realistic \
+DPO_BETA=500 \
+DPO_OUTPUT_DIR=dpo_output_v100 \
+bash scripts/run_dpo.sh \
+  --epochs 3 \
+  --lora-rank 8 \
+  --learning-rate 5e-6
+```
+
+Resume an interrupted DPO run:
+
+```bash
+bash scripts/run_dpo.sh \
+  --resume-from-checkpoint dpo_output/shutdown
+```
+
+### Hybrid: DPO → Flow-GRPO
+
+After a finished DPO run, continue with online RL from the DPO LoRA:
+
+```bash
+bash scripts/run_dpo.sh
+bash scripts/run_hybrid_training.sh
+```
+
+Or point Hybrid at a specific DPO checkpoint:
+
+```bash
+DPO_CHECKPOINT=dpo_output/final \
+FLOW_GRPO_OUTPUT_DIR=hybrid_flow_grpo_output \
+bash scripts/run_hybrid_training.sh \
+  --epochs 1 \
+  --group-size 2
+```
+
+Equivalent without the helper:
+
+```bash
+bash scripts/run_training.sh \
+  --init-from-lora dpo_output/final \
+  --output-dir hybrid_flow_grpo_output
+```
+
 ## Resume and ACPI shutdown checkpoints
 
 Every checkpoint contains the LoRA weights, optimizer and GradScaler state,
 random-number-generator states, and the next epoch/dataset position. Resume
-from either a checkpoint directory or its `flow_grpo_lora.pt` file:
+from either a checkpoint directory or its `flow_grpo_lora.pt` /
+`dpo_lora.pt` file:
 
 ```bash
 bash scripts/run_training.sh \
@@ -135,6 +207,7 @@ the nearest safe point and atomically writes:
 
 ```text
 flow_grpo_output/shutdown/flow_grpo_lora.pt
+dpo_output/shutdown/dpo_lora.pt
 ```
 
 Restart it with the same training parameters and the shutdown checkpoint:
@@ -166,7 +239,10 @@ use periodic checkpoints as an additional safeguard.
 ```powershell
 .\scripts\setup_vm.ps1
 .\scripts\run_smoke_training.ps1
+.\scripts\run_smoke_dpo.ps1
 .\scripts\run_training.ps1 -Epochs 3 -GroupSize 4
+.\scripts\run_dpo.ps1 -Epochs 3 -Beta 500
+.\scripts\run_training.ps1 -Epochs 3 -InitFromLora dpo_output\final -OutputDirectory hybrid_flow_grpo_output
 .\scripts\run_training.ps1 -Epochs 3 -ResumeFromCheckpoint flow_grpo_output\shutdown
 ```
 
@@ -181,10 +257,14 @@ short run and `-LrPipeline LR_06_realistic` to select one degradation type.
 ```
 
 The validator checks exact dependency versions, required FLUX.2 APIs, free
-disk, every dataset image, CUDA, VRAM and bf16 support. On a CPU-only machine,
-dataset and import validation can still be run with `--allow-no-cuda`.
+disk, every dataset image, both Flow-GRPO and DPO loaders, CUDA, VRAM and bf16
+support. On a CPU-only machine, dataset and import validation can still be run
+with `--allow-no-cuda`.
 
 ## Inference with a trained checkpoint
+
+Flow-GRPO, DPO and Hybrid checkpoints share the same `transformer_lora` key.
+Pass either a file or a checkpoint directory:
 
 ```bash
 .venv/bin/python scripts/flow_grpo_inference.py \
@@ -192,6 +272,14 @@ dataset and import validation can still be run with `--allow-no-cuda`.
   --prompt "An eighteenth-century decorative hunting scene" \
   --checkpoint flow_grpo_output/final/flow_grpo_lora.pt \
   --output inference_output/upscaled.png
+```
+
+```bash
+.venv/bin/python scripts/flow_grpo_inference.py \
+  --image flow_grpo_dataset/lr/0001_artwork_26_like.png \
+  --prompt "An eighteenth-century decorative landscape panel with a river" \
+  --checkpoint dpo_output/final \
+  --output inference_output/dpo_upscaled.png
 ```
 
 The first training or inference run downloads FLUX.2 Klein 4B and the CLIP model

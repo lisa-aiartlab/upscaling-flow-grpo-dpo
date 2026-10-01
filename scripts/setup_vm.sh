@@ -29,4 +29,12 @@ source scripts/env.sh
 "${FLOW_GRPO_PYTHON}" scripts/validate_setup.py \
   --mixed-precision "${FLOW_GRPO_MIXED_PRECISION:-fp16}"
 
-echo "Environment is ready. Run: bash scripts/run_smoke_training.sh"
+echo "Environment is ready."
+echo "Smoke tests:"
+echo "  bash scripts/run_smoke_training.sh   # Flow-GRPO"
+echo "  bash scripts/run_smoke_dpo.sh        # offline DPO"
+echo "Full training:"
+echo "  bash scripts/run_training.sh"
+echo "  bash scripts/run_dpo.sh"
+echo "Hybrid (DPO → Flow-GRPO):"
+echo "  bash scripts/run_hybrid_training.sh"

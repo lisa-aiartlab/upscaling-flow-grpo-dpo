@@ -19,6 +19,7 @@ from PIL import Image
 from diffusers import Flux2KleinPipeline
 
 from flow_grpo import load_baseline_manifest
+from dpo import load_preference_manifest
 
 
 EXPECTED_VERSIONS = {
@@ -60,11 +61,16 @@ def validate_records(name: str, records: list) -> None:
     for record in records:
         if not record.lr_path.is_file():
             raise FileNotFoundError(record.lr_path)
-        if record.reference_path is not None and not record.reference_path.is_file():
-            raise FileNotFoundError(record.reference_path)
+        reference_path = getattr(record, "reference_path", None)
+        chosen_path = getattr(record, "chosen_path", None)
+        rejected_path = getattr(record, "rejected_path", None)
+        for image_path in (reference_path, chosen_path, rejected_path):
+            if image_path is not None and not image_path.is_file():
+                raise FileNotFoundError(image_path)
         checked_images.add(record.lr_path)
-        if record.reference_path is not None:
-            checked_images.add(record.reference_path)
+        for image_path in (reference_path, chosen_path, rejected_path):
+            if image_path is not None:
+                checked_images.add(image_path)
 
     for image_path in checked_images:
         with Image.open(image_path) as image:
@@ -89,6 +95,9 @@ def validate_pipeline_api() -> None:
         "encode_prompt",
         "prepare_image_latents",
         "prepare_latents",
+        "_encode_vae_image",
+        "_pack_latents",
+        "_prepare_latent_ids",
         "_unpack_latents_with_ids",
         "_unpatchify_latents",
     }
@@ -143,6 +152,27 @@ def main() -> None:
         "Fetched degradation dataset",
         load_baseline_manifest(str(degraded_manifest), None),
     )
+    validate_records(
+        "DPO preference loader (curated)",
+        load_preference_manifest(str(paired_manifest), None),
+    )
+    validate_records(
+        "DPO preference loader (degradation, one pipeline)",
+        load_preference_manifest(
+            str(degraded_manifest),
+            max_samples=2,
+            lr_pipeline="LR_01_resize",
+        ),
+    )
+
+    training_scripts = (
+        TRAINING_DIRECTORY / "flow_grpo.py",
+        TRAINING_DIRECTORY / "dpo.py",
+    )
+    for script_path in training_scripts:
+        if not script_path.is_file():
+            raise FileNotFoundError(f"Missing training script: {script_path}")
+    print("Training scripts: flow_grpo.py, dpo.py")
 
     if not torch.cuda.is_available():
         if not args.allow_no_cuda:

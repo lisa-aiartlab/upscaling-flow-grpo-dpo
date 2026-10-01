@@ -216,6 +216,9 @@ data/
 flow_grpo_output*/
 flow_grpo_smoke_output*/
 flow_grpo_launcher_smoke_output/
+dpo_output*/
+dpo_smoke_output*/
+hybrid_flow_grpo_output*/
 inference_output/
 *.pt
 *.safetensors
